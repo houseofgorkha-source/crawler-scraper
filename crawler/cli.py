@@ -66,12 +66,28 @@ async def _blob_store() -> BlobStore:
     return BlobStore(client, S3_BUCKET)
 
 
+def _install_stop_handler(stop: asyncio.Event) -> None:
+    # ProactorEventLoop (the asyncio default on Windows) does not implement
+    # add_signal_handler; fall back to signal.signal there. Ctrl+C still
+    # raises KeyboardInterrupt in that case, which is caught by cmd_* callers.
+    loop = asyncio.get_running_loop()
+    try:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, stop.set)
+    except NotImplementedError:
+        def _handler(signum, frame):
+            loop.call_soon_threadsafe(stop.set)
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(sig, _handler)
+
+
 async def cmd_seed(args: argparse.Namespace) -> None:
     pool = await _pool()
     redis = aioredis.from_url(REDIS_URL)
     frontier = PostgresFrontier(pool, redis, robots_fetcher=_fetch_robots)
     n = await frontier.seed(args.urls)
     log.info("seeded", requested=len(args.urls), inserted=n)
+    await redis.aclose()
     await pool.close()
 
 
@@ -92,9 +108,7 @@ async def cmd_crawl(args: argparse.Namespace) -> None:
     ]
 
     stop = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, stop.set)
+    _install_stop_handler(stop)
 
     async def reaper_loop():
         while not stop.is_set():
@@ -115,8 +129,10 @@ async def cmd_crawl(args: argparse.Namespace) -> None:
         w.stop()
     for t in tasks:
         t.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
     if renderer:
         await renderer.aclose()
+    await redis.aclose()
     await pool.close()
 
 
@@ -133,9 +149,7 @@ async def cmd_index(args: argparse.Namespace) -> None:
         indexer = Indexer(db, search, store)
 
         stop = asyncio.Event()
-        loop = asyncio.get_running_loop()
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, stop.set)
+        _install_stop_handler(stop)
 
         task = asyncio.create_task(indexer.run())
         log.info("indexer_started")
