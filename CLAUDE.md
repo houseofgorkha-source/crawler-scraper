@@ -76,24 +76,31 @@ Two more, platform-only, fixes:
   `AbstractConnection.__del__` on exit. Fixed by calling
   `await redis.aclose()` before `pool.close()`.
 
-Not yet exercised:
+**Near-duplicate suppression is now exercised.** `index.py`'s
+`find_near_duplicate`/`mark_duplicates` path went untested for a long
+time — the documents indexed live were all distinct, so the near-dup
+branch ran but never matched anything real. `tests/integration/
+test_near_duplicate.py` now seeds a genuine near-duplicate pair
+(hamming distance 3, real `hamming()`) and confirms it's found, that a
+dissimilar pair (distance 4) isn't flagged, that a row never matches
+itself, and that unlisted (`simhash IS NULL`) rows are never candidates.
 
-- **Near-duplicate suppression.** `index.py`'s `find_near_duplicate` /
-  `mark_duplicates` path — the documents indexed so far were all distinct,
-  so the near-dup branch ran but never matched anything real.
-
-An automated test suite now exists (`tests/`, see "Tests" below) covering
-`normalize.py`, `extract.py`'s `simhash`/`hamming`/`HtmlExtractor`,
-`policy.py`'s robots parsing, `fetch.py`'s `needs_render()` heuristic,
-`scrape_extract.py`'s field extraction (including nested/repeated and
-XPath), and — as integration tests against a dedicated database —
+An automated test suite exists (`tests/`, see "Tests" below; 120 tests as
+of this writing) covering `normalize.py`, `extract.py`'s `simhash`/
+`hamming`/`HtmlExtractor`, `policy.py`'s robots parsing, `fetch.py`'s
+`needs_render()` heuristic, `scrape_extract.py`'s field extraction
+(nested/repeated/XPath), `CrawlWorker`/`ScrapeWorker`'s full `_handle()`
+orchestration (every terminal branch, mocked frontier/fetcher/renderer/
+extractor/store, no live infra), `Indexer._process()`'s near-dup routing,
+and — as integration tests against a dedicated database —
 `claim_urls()`/`claim_scrape_targets()`'s domain fairness, `SKIP LOCKED`
-concurrency, the shared politeness clock, `is_active` enforcement, and
-`PostgresFrontier`'s round trips including both Crawler↔Scraper feed
-directions. Still not covered: `worker.py`/`scrape_worker.py`'s own
-orchestration logic (claim → fetch → extract → complete) end-to-end
-without live infra, `render.py`'s advisory-lock mechanism, `index.py`,
-and `store.py`.
+concurrency, the shared politeness clock, `is_active` enforcement,
+`find_near_duplicate`, and `PostgresFrontier`'s round trips including both
+Crawler↔Scraper feed directions. Runs on every push/PR via GitHub Actions
+(`.github/workflows/tests.yml`). Still not covered: `render.py`'s
+advisory-lock mechanism itself (only ever verified live, not in the
+suite), `IndexerDB`'s own queries beyond `find_near_duplicate`, and
+`store.py`.
 
 ## Non-negotiable design decisions (do not "simplify" these away)
 
