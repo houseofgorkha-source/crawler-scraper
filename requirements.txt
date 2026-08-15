@@ -1,0 +1,18 @@
+# Fetch + concurrency
+httpx[http2]==0.27.2
+# Parsing (selectolax is ~10x lxml on the parse-and-discard workload)
+selectolax==0.3.21
+# Escalation tier only
+playwright==1.47.0
+# Durable state
+asyncpg==0.29.0
+# Working set / coordination
+redis==5.0.8
+# Object storage
+aioboto3==13.1.1
+zstandard==0.23.0
+# Search
+meilisearch-python-sdk==3.1.0
+# Ops
+structlog==24.4.0
+prometheus-client==0.21.0
