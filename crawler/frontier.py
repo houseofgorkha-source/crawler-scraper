@@ -15,9 +15,13 @@ from datetime import datetime, timezone
 import asyncpg
 import redis.asyncio as aioredis
 
-from .contracts import CrawlTask, DiscoveredLink, ExtractedDoc, FetchOutcome, FetchResult
+from .contracts import (
+    CrawlTask, DiscoveredLink, ExtractedDoc, FetchOutcome, FetchResult,
+    ScrapedRecord, ScrapeTask,
+)
 from .normalize import normalize, registrable_host
 from .policy import DomainPolicy, parse_robots, DEFAULT_CRAWL_DELAY_MS
+from .scrape_extract import ScrapeSpec, spec_from_row
 
 log = logging.getLogger(__name__)
 
@@ -303,3 +307,203 @@ class PostgresFrontier:
                     if result is not None:
                         inserted += 1
         return inserted
+
+    # ------------------------------------------------------------------ #
+    # Scraper -- a peer queue, not a mode of the Crawler above. Shares the
+    # same pool/redis/robots machinery; everything below reads/writes
+    # scrape_specs / scrape_targets / scraped_records instead of
+    # urls / documents, and claim_scrape_targets() gates on the exact same
+    # domains.next_available_at clock claim_urls() does.
+    # ------------------------------------------------------------------ #
+    async def claim_scrape(self, worker_id: str, batch: int, lease_s: int) -> list[ScrapeTask]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM claim_scrape_targets($1, $2, $3)", worker_id, batch, lease_s
+            )
+            if not rows:
+                return []
+            spec_rows = await conn.fetch(
+                "SELECT id, render_mode FROM scrape_specs WHERE id = ANY($1::bigint[])",
+                list({r["spec_id"] for r in rows}),
+            )
+        render_mode_by_spec = {r["id"]: r["render_mode"] for r in spec_rows}
+        return [
+            ScrapeTask(
+                target_id=r["target_id"], url=r["url"], host=r["host"], spec_id=r["spec_id"],
+                render_mode=render_mode_by_spec.get(r["spec_id"], "auto"),
+                etag=r["etag"], last_modified=r["last_modified"],
+            )
+            for r in rows
+        ]
+
+    async def get_scrape_spec(self, spec_id: int) -> ScrapeSpec | None:
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT * FROM scrape_specs WHERE id = $1", spec_id)
+        if row is None:
+            return None
+        row = dict(row)
+        row["fields"] = json.loads(row["fields"]) if isinstance(row["fields"], str) else row["fields"]
+        return spec_from_row(row)
+
+    async def skip_scrape(self, task: ScrapeTask, reason: str) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """UPDATE scrape_targets SET status = 'skipped', lease_owner = NULL,
+                       lease_expires_at = NULL WHERE id = $1""", task.target_id,
+            )
+        log.info("scrape skipped target_id=%s reason=%s", task.target_id, reason)
+
+    async def reschedule_scrape(self, task: ScrapeTask) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """UPDATE scrape_targets SET status = 'done', lease_owner = NULL,
+                       lease_expires_at = NULL, next_attempt_at = now() + interval '7 days',
+                       consecutive_failures = 0
+                   WHERE id = $1""", task.target_id,
+            )
+
+    async def fail_scrape(self, task: ScrapeTask, result: FetchResult,
+                          max_failures: int = MAX_FAILURES_DEFAULT) -> None:
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """UPDATE scrape_targets SET
+                       consecutive_failures = consecutive_failures + 1,
+                       last_status_code = $2,
+                       status = CASE WHEN consecutive_failures + 1 >= $3
+                                     THEN 'failed'::scrape_status ELSE 'pending'::scrape_status END,
+                       lease_owner = NULL, lease_expires_at = NULL,
+                       next_attempt_at = now() + (make_interval(mins => 1) *
+                                                   power(2, least(consecutive_failures, 6)))
+                   WHERE id = $1
+                   RETURNING consecutive_failures, status""",
+                task.target_id, result.status_code, max_failures,
+            )
+        if row and row["status"] == "failed":
+            log.warning("target_id=%s permanently failed after %s attempts",
+                       task.target_id, row["consecutive_failures"])
+
+    async def complete_scrape(self, task: ScrapeTask, result: FetchResult,
+                              record: ScrapedRecord, raw_key: str | None) -> None:
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    """UPDATE scrape_targets SET
+                            status = 'done', lease_owner = NULL, lease_expires_at = NULL,
+                            last_attempted_at = now(), next_attempt_at = now() + interval '7 days',
+                            last_status_code = $2, consecutive_failures = 0,
+                            etag = $3, last_modified = $4
+                        WHERE id = $1""",
+                    task.target_id, result.status_code, result.etag, result.last_modified,
+                )
+                await conn.execute(
+                    """INSERT INTO scraped_records (target_id, spec_id, data, raw_key, updated_at)
+                       VALUES ($1, $2, $3, $4, now())
+                       ON CONFLICT (target_id) DO UPDATE SET
+                           data = EXCLUDED.data, raw_key = EXCLUDED.raw_key,
+                           extracted_at = now(), updated_at = now()""",
+                    task.target_id, task.spec_id, json.dumps(record.data), raw_key,
+                )
+
+    async def register_spec(self, name: str, fields: list[dict], version: int = 1,
+                            render_mode: str = "auto", link_field: str | None = None,
+                            feed_to_crawler: bool = False, feed_from_crawler: bool = False,
+                            host_pattern: str | None = None, path_regex: str | None = None) -> int:
+        async with self.pool.acquire() as conn:
+            spec_id = await conn.fetchval(
+                """INSERT INTO scrape_specs
+                       (name, version, fields, render_mode, link_field,
+                        feed_to_crawler, feed_from_crawler, host_pattern, path_regex)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+                   ON CONFLICT (name, version) DO UPDATE SET
+                       fields = EXCLUDED.fields, render_mode = EXCLUDED.render_mode,
+                       link_field = EXCLUDED.link_field,
+                       feed_to_crawler = EXCLUDED.feed_to_crawler,
+                       feed_from_crawler = EXCLUDED.feed_from_crawler,
+                       host_pattern = EXCLUDED.host_pattern, path_regex = EXCLUDED.path_regex
+                   RETURNING id""",
+                name, version, json.dumps(fields), render_mode, link_field,
+                feed_to_crawler, feed_from_crawler, host_pattern, path_regex,
+            )
+        return spec_id
+
+    async def submit_scrape_targets(self, spec_id: int, urls: list[str]) -> int:
+        inserted = 0
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                for raw_url in urls:
+                    n = normalize(raw_url)
+                    if not n:
+                        continue
+                    host = registrable_host(n)
+                    if not host:
+                        continue
+                    domain_id = await conn.fetchval(
+                        """INSERT INTO domains (host) VALUES ($1)
+                           ON CONFLICT (host) DO UPDATE SET host = EXCLUDED.host
+                           RETURNING id""", host,
+                    )
+                    result = await conn.fetchval(
+                        """INSERT INTO scrape_targets (spec_id, domain_id, url)
+                           VALUES ($1, $2, $3)
+                           ON CONFLICT (spec_id, url_key) DO NOTHING RETURNING id""",
+                        spec_id, domain_id, n,
+                    )
+                    if result is not None:
+                        inserted += 1
+        return inserted
+
+    async def enroll_scrape_targets(self, url: str, host: str) -> int:
+        """Crawler -> Scraper feed: enroll `url` into every active spec whose
+        scope matches it. Called by CrawlWorker only when explicitly opted
+        in (--feed-scraper); a no-op set of specs means this is a no-op."""
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                domain_id = await conn.fetchval("SELECT id FROM domains WHERE host = $1", host)
+                if domain_id is None:
+                    return 0
+                specs = await conn.fetch(
+                    """SELECT id FROM scrape_specs
+                       WHERE is_active AND feed_from_crawler
+                         AND (host_pattern IS NULL OR host_pattern = $1)
+                         AND (path_regex IS NULL OR $2 ~ path_regex)""",
+                    host, url,
+                )
+                n = 0
+                for row in specs:
+                    inserted = await conn.fetchval(
+                        """INSERT INTO scrape_targets (spec_id, domain_id, url)
+                           VALUES ($1, $2, $3)
+                           ON CONFLICT (spec_id, url_key) DO NOTHING RETURNING id""",
+                        row["id"], domain_id, url,
+                    )
+                    if inserted is not None:
+                        n += 1
+                return n
+
+    async def feed_links_to_crawler(self, origin_url: str, links: list[DiscoveredLink]) -> int:
+        """Scraper -> Crawler feed: hand discovered links to the same
+        frontier.add() the Crawler itself uses, after making sure the
+        scrape target's own URL has a `urls` row to be the FK parent for
+        the new link edges (a Scraper run independently of the Crawler may
+        never have created one)."""
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                host = registrable_host(origin_url)
+                if not host:
+                    return 0
+                domain_id = await conn.fetchval(
+                    """INSERT INTO domains (host) VALUES ($1)
+                       ON CONFLICT (host) DO UPDATE SET host = EXCLUDED.host
+                       RETURNING id""", host,
+                )
+                origin_id = await conn.fetchval(
+                    """INSERT INTO urls (domain_id, url, depth, priority)
+                       VALUES ($1, $2, 0, 100)
+                       ON CONFLICT (url_key) DO NOTHING RETURNING id""",
+                    domain_id, origin_url,
+                )
+                if origin_id is None:
+                    origin_id = await conn.fetchval(
+                        "SELECT id FROM urls WHERE url_key = digest($1, 'sha256')", origin_url,
+                    )
+        return await self.add(links, from_url_id=origin_id, depth=0)
