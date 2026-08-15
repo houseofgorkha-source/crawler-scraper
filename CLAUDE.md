@@ -81,10 +81,19 @@ Not yet exercised:
 - **Near-duplicate suppression.** `index.py`'s `find_near_duplicate` /
   `mark_duplicates` path — the documents indexed so far were all distinct,
   so the near-dup branch ran but never matched anything real.
-- **Automated test suite.** `normalize.py` and the `simhash`/`hamming`
-  functions in `extract.py` remain unit-tested in isolation only, no
-  automated suite yet, though both have now also been exercised indirectly
-  by the live pipeline runs above.
+
+An automated test suite now exists (`tests/`, see "Tests" below) covering
+`normalize.py`, `extract.py`'s `simhash`/`hamming`/`HtmlExtractor`,
+`policy.py`'s robots parsing, `fetch.py`'s `needs_render()` heuristic,
+`scrape_extract.py`'s field extraction (including nested/repeated and
+XPath), and — as integration tests against a dedicated database —
+`claim_urls()`/`claim_scrape_targets()`'s domain fairness, `SKIP LOCKED`
+concurrency, the shared politeness clock, `is_active` enforcement, and
+`PostgresFrontier`'s round trips including both Crawler↔Scraper feed
+directions. Still not covered: `worker.py`/`scrape_worker.py`'s own
+orchestration logic (claim → fetch → extract → complete) end-to-end
+without live infra, `render.py`'s advisory-lock mechanism, `index.py`,
+and `store.py`.
 
 ## Non-negotiable design decisions (do not "simplify" these away)
 
@@ -279,6 +288,28 @@ python -m crawler.cli spec add spec.json
 python -m crawler.cli submit-scrape <spec-name> https://example.com/p/1 ...
 python -m crawler.cli scrape --workers 8 [--no-render] [--render-pages N]
 ```
+
+## Tests
+
+Integration tests run against a **dedicated** `crawler_test` database, never
+the dev database (`crawler`) -- this repo's history includes multiple
+incidents where ad-hoc scripts pointed at the real dev DSN and claimed real
+frontier work. `tests/conftest.py`'s `db` fixture truncates `crawler_test`
+before every test; it never touches `crawler`.
+
+```bash
+pip install -r requirements-dev.txt
+docker compose exec -T postgres psql -U postgres -c "CREATE DATABASE crawler_test;"
+cat db/schema.sql | docker compose exec -T postgres psql -U postgres -d crawler_test
+
+export CRAWLER_TEST_PG_DSN="postgresql://postgres:crawler@localhost/crawler_test"
+export CRAWLER_TEST_REDIS_URL="redis://localhost:6379/15"   # isolated logical db
+python -m pytest
+```
+
+`tests/unit/` needs no infrastructure (pure functions: `normalize.py`,
+`extract.py`, `policy.py`, `fetch.py`'s heuristic, `scrape_extract.py`).
+`tests/integration/` needs the test database above.
 
 ## Scale-out path (do not jump ahead of the current bottleneck)
 
