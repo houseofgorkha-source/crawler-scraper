@@ -36,13 +36,17 @@ MAX_DEPTH = 6
 
 class CrawlWorker:
     def __init__(self, frontier, store, fetcher=None, renderer=None,
-                 extractor=None, worker_id: str | None = None):
+                 extractor=None, worker_id: str | None = None,
+                 feed_scraper: bool = False):
         self.frontier = frontier
         self.store = store
         self.fetcher = fetcher or HttpFetcher()
         self.renderer = renderer
         self.extractor = extractor or HtmlExtractor()
         self.worker_id = worker_id or f"worker-{uuid.uuid4().hex[:8]}"
+        # Crawler -> Scraper feed, opt-in only (--feed-scraper). Off by
+        # default, so plain `crawl` behaves exactly as before.
+        self.feed_scraper = feed_scraper
         self._running = False
 
     async def run(self) -> None:
@@ -89,6 +93,15 @@ class CrawlWorker:
         text_key = await self.store.put_text(task.host, task.url_id, doc.text)
 
         await self.frontier.complete(result, doc, raw_key=raw_key, text_key=text_key)
+
+        if self.feed_scraper:
+            # Best-effort: Scraper being unreachable/misconfigured must
+            # never break the Crawler's own completion, same principle as
+            # indexing never blocking the crawl.
+            try:
+                await self.frontier.enroll_scrape_targets(task.url, task.host)
+            except Exception:
+                log.exception("scrape enrollment failed for %s", task.url)
 
         if task.depth < MAX_DEPTH and doc.links:
             n = await self.frontier.add(doc.links, from_url_id=task.url_id,
