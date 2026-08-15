@@ -142,8 +142,19 @@ python -m crawler.cli index
 4. **Bottleneck: Postgres write throughput** — introduce a real queue between
    fetch and extract. Only then is Kafka justified.
 
-## Remaining stubs
+## Verified
 
-`frontier.py` (Postgres/Redis implementation of the `Frontier` protocol) and
-`cli.py` are the next pieces to write — the contracts and schema they must
-satisfy are complete.
+The full pipeline — seed → `claim_urls()` → robots resolution/recheck →
+static fetch → extract → blob store → Postgres commit → link discovery →
+recursive re-crawl → async indexing → Meilisearch search — has been run
+end-to-end against live Postgres, Redis, MinIO, and Meilisearch, including
+cross-domain link discovery. The Playwright render-escalation tier
+(`needs_render()` → `PlaywrightRenderer` → extraction of the post-render
+DOM) has been verified separately against a local SPA fixture. Four bugs
+turned up in the process — a `claim_urls()` `FOR UPDATE`/`DISTINCT ON`
+conflict, a `simhash` int64 overflow, a missing `brotli` dependency causing
+silent response corruption, and an indexer settings type mismatch — all
+fixed; see `CLAUDE.md` for details and `crawler/frontier.py`,
+`crawler/index.py`, `db/schema.sql`, and `requirements.txt` for the fixes
+themselves. Not yet exercised: the indexer's actual near-duplicate
+suppression path (no real duplicate has been indexed yet to trigger it).

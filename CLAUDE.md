@@ -15,27 +15,63 @@ deferred, not forgotten. If you think one is needed, say so and ask first.
 
 ## Current state — read this before doing anything else
 
-Everything is written and syntax-checked (`python -m py_compile crawler/*.py`
-passes). Two things are **not yet verified against live infrastructure**:
+The full pipeline has been run end-to-end against live infrastructure
+(Postgres, Redis, MinIO, Meilisearch via `docker compose up -d`): seed →
+`claim_urls()` → robots resolution/recheck → static fetch → extract → blob
+store → Postgres commit → link discovery → recursive re-crawl → async
+indexing → Meilisearch search all verified working, including cross-domain
+link discovery (a seeded `example.com` URL was followed out to `iana.org`,
+`icann.org`, and beyond). The Playwright render-escalation tier has also
+been verified separately: `needs_render()` correctly detected an empty
+app-shell root on a local SPA fixture, `PlaywrightRenderer` executed the
+page's JS, and the extracted text/links matched the post-render DOM, not
+the empty static shell.
 
-1. **`crawler/frontier.py` and `crawler/db.py`** — the asyncpg queries have
-   never run against a real Postgres instance. Likely failure points:
-   parameter binding, the `claim_urls()` SQL function's `DISTINCT ON` +
-   `FOR UPDATE SKIP LOCKED` interaction, and the `ON CONFLICT (url_key)`
-   dedup path in `frontier.add()` / `frontier.seed()`.
-2. **The full pipeline end-to-end** — claim → fetch → extract → store →
-   Postgres commit → index — has never run as one flow.
+Four bugs were found and fixed during this verification (see `frontier.py`,
+`index.py`, `db/schema.sql`, `requirements.txt` for the fixes and their
+inline comments):
 
-**Your first task should be:** bring up `docker compose up -d`, create the
-MinIO bucket, seed one URL, run one worker, and trace it through the
-pipeline by hand (check the `urls`, `domains`, `documents` tables after each
-stage) until it works end-to-end. Fix bugs as you find them, but flag any
-fix that changes behavior described in `README.md` rather than just
-correcting a typo or query bug.
+1. **`claim_urls()` — `FOR UPDATE` + `DISTINCT ON`.** Postgres rejects the
+   two combined in one query (`FOR UPDATE is not allowed with DISTINCT
+   clause`) — this was the exact interaction flagged as a likely failure
+   point, and it was. Fixed by splitting into a plain `DISTINCT` to pick
+   eligible domains, then a `LATERAL` join per domain doing the priority
+   ordered `FOR UPDATE SKIP LOCKED LIMIT 1` pick. Same one-url-per-domain,
+   skip-locked semantics as before, just in two steps instead of one.
+2. **`simhash` int64 overflow.** `extract.simhash()` returns an *unsigned*
+   64-bit value; Postgres `bigint` is signed, so values ≥2^63 overflowed on
+   bind in `frontier.complete()`. Fixed by converting to the equivalent
+   two's-complement signed value at the write boundary — hamming distance
+   and XOR are unaffected since Python's bitwise ops treat negative ints as
+   infinite two's-complement.
+3. **Silent brotli corruption.** `fetch.py` advertises `Accept-Encoding: br`
+   but `brotli`/`brotlicffi` wasn't in `requirements.txt`, so httpx silently
+   returned undecoded compressed bytes as if the fetch had succeeded (no
+   exception, no error outcome). Added `brotli==1.1.0` to requirements.
+4. **Indexer settings type mismatch.** `index.py`'s `SETTINGS` was a plain
+   camelCase dict; `meilisearch-python-sdk==3.1.0`'s `update_settings()`
+   expects a `MeilisearchSettings` model instance with snake_case fields.
+   Fixed by constructing the model instead of a dict.
 
-Only unit-tested so far, in isolation: `normalize.py` (URL canonicalization)
-and the `simhash`/`hamming` functions in `extract.py`. Both behaved
-correctly in manual testing but have no automated test suite yet.
+A fifth, platform-only issue was also fixed: on Windows, the default
+asyncio event loop doesn't implement `add_signal_handler`
+(`NotImplementedError`), so `crawl` and `index` crashed immediately on
+startup. `cli.py` now falls back to `signal.signal` there. Clean shutdown
+(`Ctrl+C` → `shutting_down` → workers stop → Postgres/Redis connections
+closed) has been confirmed manually. A related resource-cleanup bug was
+also fixed: the Redis client created in `cmd_seed`/`cmd_crawl` was never
+explicitly closed, so its connections were garbage-collected after
+`asyncio.run()` had already torn down the event loop, producing a
+`RuntimeError: Event loop is closed` inside `AbstractConnection.__del__`
+on exit. Fixed by calling `await redis.aclose()` before `pool.close()`.
+
+Not yet exercised: the indexer's actual near-duplicate *suppression* path
+in `index.py` (`find_near_duplicate` / `mark_duplicates`) — the documents
+indexed so far were all distinct, so the near-dup branch ran but never
+matched anything real. `normalize.py` and the `simhash`/`hamming` functions
+in `extract.py` remain unit-tested in isolation only, no automated suite
+yet, though both have now also been exercised indirectly by the live
+pipeline runs above.
 
 ## Non-negotiable design decisions (do not "simplify" these away)
 
@@ -94,9 +130,11 @@ crawler/extract.py     content extraction, link discovery, sha256 +
                         simhash fingerprinting. Tested and working.
 crawler/worker.py      the per-task loop: claim → robots recheck → fetch
                         → escalate? → extract → store → commit → enqueue
-crawler/frontier.py    Postgres/Redis Frontier implementation — UNTESTED
-                        against live infra, see above
-crawler/db.py          query layer for the indexer process — UNTESTED
+crawler/frontier.py    Postgres/Redis Frontier implementation — verified
+                        end-to-end against live infra, see above
+crawler/db.py          query layer for the indexer process — verified
+                        against live infra (near-dup suppression path not
+                        yet exercised with a real duplicate, see above)
 crawler/index.py       async Meilisearch drain, near-dup suppression
 crawler/store.py       object storage (zstd-compressed, MinIO/S3)
 crawler/cli.py         entrypoint: seed / crawl / index / reap
