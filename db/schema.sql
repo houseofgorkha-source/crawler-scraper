@@ -205,18 +205,38 @@ RETURNS TABLE (url_id bigint, url text, host text, depth integer, etag text,
                last_modified text, js_required boolean)
 LANGUAGE plpgsql AS $$
 BEGIN
+    -- Postgres rejects FOR UPDATE combined with DISTINCT ON in the same
+    -- query ("FOR UPDATE is not allowed with DISTINCT clause"), so the
+    -- one-row-per-domain pick and the row lock have to happen in separate
+    -- steps: a plain DISTINCT to choose eligible domains, then a LATERAL
+    -- join per domain that does the ORDER BY + FOR UPDATE SKIP LOCKED + LIMIT 1.
     RETURN QUERY
-    WITH candidate AS (
-        SELECT DISTINCT ON (u.domain_id) u.id
+    WITH eligible AS (
+        SELECT DISTINCT u.domain_id, d.host, d.js_required
         FROM urls u
         JOIN domains d ON d.id = u.domain_id
         WHERE u.status = 'pending'
           AND u.next_crawl_at <= now()
           AND d.is_crawlable
           AND d.next_available_at <= now()
-        ORDER BY u.domain_id, u.priority DESC, u.next_crawl_at
-        FOR UPDATE OF u SKIP LOCKED
+        ORDER BY u.domain_id
         LIMIT p_batch_size
+    ),
+    candidate AS (
+        SELECT e.domain_id, e.host, e.js_required,
+               picked.id AS url_id, picked.url, picked.depth,
+               picked.etag, picked.last_modified
+        FROM eligible e
+        CROSS JOIN LATERAL (
+            SELECT u.id, u.url, u.depth, u.etag, u.last_modified
+            FROM urls u
+            WHERE u.domain_id = e.domain_id
+              AND u.status = 'pending'
+              AND u.next_crawl_at <= now()
+            ORDER BY u.priority DESC, u.next_crawl_at
+            FOR UPDATE OF u SKIP LOCKED
+            LIMIT 1
+        ) picked
     ),
     claimed AS (
         UPDATE urls u
@@ -225,18 +245,20 @@ BEGIN
             lease_expires_at = now() + make_interval(secs => p_lease_seconds),
             attempt_count    = u.attempt_count + 1
         FROM candidate c
-        WHERE u.id = c.id
-        RETURNING u.id, u.url, u.domain_id, u.depth, u.etag, u.last_modified
+        WHERE u.id = c.url_id
+        RETURNING u.id, u.domain_id
     ),
     gated AS (
         UPDATE domains d
         SET next_available_at = now() + make_interval(secs => d.crawl_delay_ms / 1000.0)
         FROM claimed cl
         WHERE d.id = cl.domain_id
-        RETURNING d.id, d.host, d.js_required
+        RETURNING d.id
     )
-    SELECT cl.id, cl.url, g.host, cl.depth, cl.etag, cl.last_modified, g.js_required
-    FROM claimed cl JOIN gated g ON g.id = cl.domain_id;
+    SELECT c.url_id, c.url, c.host, c.depth, c.etag, c.last_modified, c.js_required
+    FROM candidate c
+    JOIN claimed cl ON cl.id = c.url_id
+    JOIN gated g ON g.id = c.domain_id;
 END;
 $$;
 
