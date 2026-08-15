@@ -85,30 +85,35 @@ test_near_duplicate.py` now seeds a genuine near-duplicate pair
 dissimilar pair (distance 4) isn't flagged, that a row never matches
 itself, and that unlisted (`simhash IS NULL`) rows are never candidates.
 
-An automated test suite exists (`tests/`, see "Tests" below; 137 tests as
+An automated test suite exists (`tests/`, see "Tests" below; 145 tests as
 of this writing) covering every module in `crawler/`: `normalize.py`,
 `extract.py`'s `simhash`/`hamming`/`HtmlExtractor`, `policy.py`'s robots
 parsing, `fetch.py`'s `needs_render()` heuristic, `scrape_extract.py`'s
 field extraction (nested/repeated/XPath), `store.py`'s key derivation and
 real zstd compress/decompress round trip (fake S3 client, no MinIO
 needed), `CrawlWorker`/`ScrapeWorker`'s full `_handle()` orchestration
-(every terminal branch, mocked frontier/fetcher/renderer/extractor/store),
-`Indexer._process()`'s near-dup routing, and — as integration tests
-against a dedicated database — `claim_urls()`/`claim_scrape_targets()`'s
-domain fairness, `SKIP LOCKED` concurrency, the shared politeness clock,
-`is_active` enforcement, `IndexerDB`'s full query surface including
-`find_near_duplicate`, `render.py`'s cross-process advisory-lock mechanism
-itself (acquire/release/reuse, the actual max_pages cap under contention
-between two renderer instances, and that a crashed holder's lock releases
+both mocked (every terminal branch, `tests/unit/`) *and* against a real
+`PostgresFrontier` + a real in-process HTTP server (`tests/integration/
+test_worker_live.py`, `test_scrape_worker_live.py`) — the actual
+`claim_urls()`/`claim_scrape_targets()` → fetch → extract → complete loop,
+which this project previously only ever exercised via one-off manual
+scripts written, run, and deleted by hand throughout earlier verification;
+this closes that gap for good, `Indexer._process()`'s near-dup routing,
+and — as integration tests against a dedicated database —
+`claim_urls()`/`claim_scrape_targets()`'s domain fairness, `SKIP LOCKED`
+concurrency, the shared politeness clock, `is_active` enforcement,
+`IndexerDB`'s full query surface including `find_near_duplicate`,
+`render.py`'s cross-process advisory-lock mechanism itself (acquire/
+release/reuse, the actual max_pages cap under contention between two
+renderer instances, and that a crashed holder's lock releases
 automatically — the same thing verified live earlier in this project,
 now automated), and `PostgresFrontier`'s round trips including both
 Crawler↔Scraper feed directions. Runs on every push/PR via GitHub Actions
-(`.github/workflows/tests.yml`). Not covered: `worker.py`/`scrape_worker.py`
-tested only with mocks, never against live infra end-to-end in the suite
-(that's what the manual verification earlier in this project covered);
-`render.py`'s Playwright/Chromium interaction itself is untested (only
-the lock mechanism around it) since CI intentionally doesn't install
-browser binaries to stay fast.
+(`.github/workflows/tests.yml`). Not covered: `render.py`'s actual
+Playwright/Chromium interaction (only the lock mechanism around it) since
+CI intentionally doesn't install browser binaries to stay fast; `index.py`'s
+Meilisearch integration itself (`Indexer._process()`'s routing logic is
+covered with a mocked search client, never a real Meilisearch instance).
 
 ## Non-negotiable design decisions (do not "simplify" these away)
 
@@ -329,7 +334,12 @@ python -m pytest
 `tests/integration/` needs the test database above (also used for
 `render.py`'s advisory-lock tests, since Postgres advisory locks are the
 whole mechanism under test there -- no Playwright/browser involved).
-Runs automatically on every push/PR via `.github/workflows/tests.yml`.
+`test_worker_live.py`/`test_scrape_worker_live.py` additionally spin up
+`tests/conftest.py`'s `fixture_server` -- an in-process static file
+server on an OS-assigned port, serving `tests/fixtures/*.html` -- so the
+real `claim → fetch → extract → complete` loop runs against a real HTTP
+server with no manual setup/teardown. Runs automatically on every
+push/PR via `.github/workflows/tests.yml`.
 
 ## Scale-out path (do not jump ahead of the current bottleneck)
 

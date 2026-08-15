@@ -3,30 +3,13 @@ PostgresFrontier round-trip tests against the isolated test database.
 Uses a real Redis instance but a dedicated logical DB (index 15) so it
 can never collide with the dev cache (Redis is cache-only by design, but
 isolating it keeps test runs deterministic regardless).
+
+The `frontier` fixture itself lives in tests/conftest.py, shared with the
+live worker integration tests.
 """
-import os
-
-import pytest_asyncio
-import redis.asyncio as aioredis
-
 from crawler.contracts import (
     DiscoveredLink, ExtractedDoc, FetchOutcome, FetchResult, RenderMode, CrawlTask,
 )
-from crawler.frontier import PostgresFrontier
-
-TEST_REDIS_URL = os.environ.get("CRAWLER_TEST_REDIS_URL", "redis://localhost:6379/15")
-
-
-async def _allow_all_robots(host):
-    return None, 404  # 404 -> no restrictions, crawlable
-
-
-@pytest_asyncio.fixture
-async def frontier(db):
-    redis = aioredis.from_url(TEST_REDIS_URL)
-    await redis.flushdb()
-    yield PostgresFrontier(db, redis, robots_fetcher=_allow_all_robots)
-    await redis.aclose()
 
 
 def _doc(url_id: int, links=()) -> ExtractedDoc:
