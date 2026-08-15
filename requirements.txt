@@ -6,6 +6,11 @@ httpx[http2]==0.27.2
 brotli==1.1.0
 # Parsing (selectolax is ~10x lxml on the parse-and-discard workload)
 selectolax==0.3.21
+# Scraper only: structured extraction needs real CSS+XPath, which
+# selectolax doesn't provide. The Crawler's extract.py stays on selectolax
+# unchanged -- this is additive, not a replacement.
+lxml==5.3.0
+cssselect==1.2.0
 # Escalation tier only
 playwright==1.47.0
 # Durable state
