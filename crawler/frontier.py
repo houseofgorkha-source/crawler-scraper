@@ -149,6 +149,13 @@ class PostgresFrontier:
     async def complete(self, result: FetchResult, doc: ExtractedDoc,
                        raw_key: str, text_key: str) -> None:
         next_crawl = "now() + interval '7 days'"
+        # simhash() returns an unsigned 64-bit value; Postgres bigint is
+        # signed int64, so values >= 2**63 overflow on bind. Store the
+        # equivalent two's-complement signed value -- bitwise ops (XOR,
+        # hamming distance) on the signed form give identical results,
+        # since Python's bitwise ops treat negative ints as infinite
+        # two's-complement.
+        simhash_signed = doc.simhash - (1 << 64) if doc.simhash >= (1 << 63) else doc.simhash
         async with self.pool.acquire() as conn:
             async with conn.transaction():
                 await conn.execute(
@@ -160,7 +167,7 @@ class PostgresFrontier:
                             content_sha256 = $5, simhash = $6, render_mode = $7
                         WHERE id = $1""",
                     result.task.url_id, result.status_code, result.etag,
-                    result.last_modified, doc.content_sha256, doc.simhash,
+                    result.last_modified, doc.content_sha256, simhash_signed,
                     doc.render_mode.value,
                 )
                 await conn.execute(
