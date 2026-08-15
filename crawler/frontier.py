@@ -507,3 +507,65 @@ class PostgresFrontier:
                         "SELECT id FROM urls WHERE url_key = digest($1, 'sha256')", origin_url,
                     )
         return await self.add(links, from_url_id=origin_id, depth=0)
+
+    # ------------------------------------------------------------------ #
+    # Scraper ops -- spec management and record inspection. These are
+    # read/toggle operations for `spec list/show/activate/deactivate` and
+    # `records list/export`; nothing here is on the claim/complete hot path.
+    # ------------------------------------------------------------------ #
+    async def list_specs(self) -> list[dict]:
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """SELECT id, name, version, is_active, render_mode,
+                          feed_to_crawler, feed_from_crawler, host_pattern,
+                          path_regex, created_at
+                   FROM scrape_specs ORDER BY name, version"""
+            )
+        return [dict(r) for r in rows]
+
+    async def get_spec_row(self, name: str, version: int | None = None) -> dict | None:
+        async with self.pool.acquire() as conn:
+            if version is not None:
+                row = await conn.fetchrow(
+                    "SELECT * FROM scrape_specs WHERE name = $1 AND version = $2",
+                    name, version,
+                )
+            else:
+                row = await conn.fetchrow(
+                    "SELECT * FROM scrape_specs WHERE name = $1 ORDER BY version DESC LIMIT 1",
+                    name,
+                )
+        return dict(row) if row else None
+
+    async def set_spec_active(self, name: str, active: bool,
+                              version: int | None = None) -> int:
+        """Returns the spec id updated, or None if no matching spec exists."""
+        row = await self.get_spec_row(name, version)
+        if row is None:
+            return None
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE scrape_specs SET is_active = $2 WHERE id = $1", row["id"], active,
+            )
+        return row["id"]
+
+    async def list_scraped_records(self, spec_name: str, version: int | None = None,
+                                   limit: int = 100) -> list[dict]:
+        spec_row = await self.get_spec_row(spec_name, version)
+        if spec_row is None:
+            return []
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """SELECT t.url, r.data, r.extracted_at
+                   FROM scraped_records r
+                   JOIN scrape_targets t ON t.id = r.target_id
+                   WHERE r.spec_id = $1
+                   ORDER BY r.extracted_at DESC
+                   LIMIT $2""",
+                spec_row["id"], limit,
+            )
+        return [
+            {"url": r["url"], "data": json.loads(r["data"]) if isinstance(r["data"], str) else r["data"],
+             "extracted_at": r["extracted_at"].isoformat()}
+            for r in rows
+        ]

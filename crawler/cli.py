@@ -7,8 +7,12 @@ CLI entrypoint.
     python -m crawler.cli reap        # normally run from cron, see below
 
     python -m crawler.cli spec add spec.json
+    python -m crawler.cli spec list
+    python -m crawler.cli spec show <spec-name> [--version N]
+    python -m crawler.cli spec activate|deactivate <spec-name> [--version N]
     python -m crawler.cli submit-scrape <spec-name> https://example.com/p/1 ...
     python -m crawler.cli scrape --workers 8
+    python -m crawler.cli records list <spec-name> [--limit N] [--output file.json]
 
 crawl and scrape are independently runnable processes -- run either alone,
 both together, or wire one to feed the other (--feed-scraper on crawl,
@@ -246,6 +250,76 @@ async def cmd_spec_add(args: argparse.Namespace) -> None:
     await pool.close()
 
 
+async def cmd_spec_list(args: argparse.Namespace) -> None:
+    pool = await _pool()
+    redis = aioredis.from_url(REDIS_URL)
+    frontier = PostgresFrontier(pool, redis, robots_fetcher=_fetch_robots)
+    specs = await frontier.list_specs()
+    for s in specs:
+        log.info("spec", name=s["name"], version=s["version"], is_active=s["is_active"],
+                 render_mode=s["render_mode"], feed_to_crawler=s["feed_to_crawler"],
+                 feed_from_crawler=s["feed_from_crawler"])
+    if not specs:
+        log.info("no_specs_registered")
+    await redis.aclose()
+    await pool.close()
+
+
+async def cmd_spec_show(args: argparse.Namespace) -> None:
+    pool = await _pool()
+    redis = aioredis.from_url(REDIS_URL)
+    frontier = PostgresFrontier(pool, redis, robots_fetcher=_fetch_robots)
+    row = await frontier.get_spec_row(args.name, args.version)
+    if row is None:
+        log.error("unknown_spec", spec=args.name)
+    else:
+        fields = row["fields"]
+        fields = json.loads(fields) if isinstance(fields, str) else fields
+        print(json.dumps({**{k: v for k, v in row.items() if k != "fields"},
+                          "fields": fields}, default=str, indent=2))
+    await redis.aclose()
+    await pool.close()
+
+
+async def _cmd_spec_set_active(args: argparse.Namespace, active: bool) -> None:
+    pool = await _pool()
+    redis = aioredis.from_url(REDIS_URL)
+    frontier = PostgresFrontier(pool, redis, robots_fetcher=_fetch_robots)
+    spec_id = await frontier.set_spec_active(args.name, active, args.version)
+    if spec_id is None:
+        log.error("unknown_spec", spec=args.name)
+    else:
+        log.info("spec_active_set", spec=args.name, id=spec_id, is_active=active)
+    await redis.aclose()
+    await pool.close()
+
+
+async def cmd_spec_activate(args: argparse.Namespace) -> None:
+    await _cmd_spec_set_active(args, True)
+
+
+async def cmd_spec_deactivate(args: argparse.Namespace) -> None:
+    await _cmd_spec_set_active(args, False)
+
+
+async def cmd_records_list(args: argparse.Namespace) -> None:
+    pool = await _pool()
+    redis = aioredis.from_url(REDIS_URL)
+    frontier = PostgresFrontier(pool, redis, robots_fetcher=_fetch_robots)
+    records = await frontier.list_scraped_records(args.spec, args.version, args.limit)
+
+    if args.output:
+        with open(args.output, "w", encoding="utf-8") as f:
+            json.dump(records, f, indent=2)
+        log.info("records_exported", spec=args.spec, count=len(records), file=args.output)
+    else:
+        for r in records:
+            print(json.dumps(r, default=str))
+        log.info("records_listed", spec=args.spec, count=len(records))
+    await redis.aclose()
+    await pool.close()
+
+
 async def cmd_index(args: argparse.Namespace) -> None:
     from meilisearch_python_sdk import AsyncClient
 
@@ -327,6 +401,39 @@ def main() -> None:
     p_spec_add = spec_sub.add_parser("add", help="register a scrape spec from a JSON file")
     p_spec_add.add_argument("file", help="path to a spec JSON file")
     p_spec_add.set_defaults(func=cmd_spec_add)
+
+    p_spec_list = spec_sub.add_parser("list", help="list all registered specs")
+    p_spec_list.set_defaults(func=cmd_spec_list)
+
+    p_spec_show = spec_sub.add_parser("show", help="show a spec's full definition")
+    p_spec_show.add_argument("name")
+    p_spec_show.add_argument("--version", type=int, default=None,
+                             help="defaults to the latest version")
+    p_spec_show.set_defaults(func=cmd_spec_show)
+
+    p_spec_activate = spec_sub.add_parser("activate", help="set a spec active (resume its queue)")
+    p_spec_activate.add_argument("name")
+    p_spec_activate.add_argument("--version", type=int, default=None)
+    p_spec_activate.set_defaults(func=cmd_spec_activate)
+
+    p_spec_deactivate = spec_sub.add_parser(
+        "deactivate", help="set a spec inactive (its queue stops draining, nothing is deleted)"
+    )
+    p_spec_deactivate.add_argument("name")
+    p_spec_deactivate.add_argument("--version", type=int, default=None)
+    p_spec_deactivate.set_defaults(func=cmd_spec_deactivate)
+
+    p_records = sub.add_parser("records", help="inspect scraped_records")
+    records_sub = p_records.add_subparsers(dest="records_command", required=True)
+    p_records_list = records_sub.add_parser(
+        "list", help="list/export a spec's scraped records"
+    )
+    p_records_list.add_argument("spec", help="registered spec name")
+    p_records_list.add_argument("--version", type=int, default=None)
+    p_records_list.add_argument("--limit", type=int, default=100)
+    p_records_list.add_argument("--output", default=None,
+                                help="write JSON to this file instead of printing one per line")
+    p_records_list.set_defaults(func=cmd_records_list)
 
     p_index = sub.add_parser("index", help="run the async indexer")
     p_index.add_argument("--metrics-port", type=int, default=None,
