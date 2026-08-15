@@ -49,7 +49,7 @@ class CrawlTask:
 # --------------------------------------------------------------------------
 @dataclass(slots=True)
 class FetchResult:
-    task: CrawlTask
+    task: CrawlTask | "ScrapeTask"
     outcome: FetchOutcome
     status_code: int | None = None
     final_url: str | None = None            # after redirects; may differ from task.url
@@ -94,6 +94,33 @@ class ExtractedDoc:
 
 
 # --------------------------------------------------------------------------
+# Scraper: a peer of the Crawler, not a mode of it. Same fetch/render
+# substrate (HttpFetcher, PlaywrightRenderer, BlobStore all accept either
+# task type unchanged -- they only touch .url/.etag/.last_modified), but a
+# distinct task/result shape because a scrape target isn't a `urls` row and
+# a scraped record isn't an `ExtractedDoc`. See crawler/scrape_extract.py
+# for the spec format and crawler/scrape_worker.py for the loop.
+# --------------------------------------------------------------------------
+@dataclass(frozen=True, slots=True)
+class ScrapeTask:
+    target_id: int
+    url: str
+    host: str
+    spec_id: int
+    render_mode: str = "auto"       # "auto" | "always" | "never" -- from the spec
+    etag: str | None = None
+    last_modified: str | None = None
+
+
+@dataclass(slots=True)
+class ScrapedRecord:
+    target_id: int
+    spec_id: int
+    data: dict                      # spec-shaped structured fields
+    links: Sequence[DiscoveredLink] = field(default_factory=list)
+
+
+# --------------------------------------------------------------------------
 # Protocols. Implementations live in their own modules; anything satisfying
 # these can be swapped in (including a different language behind an RPC shim).
 # --------------------------------------------------------------------------
@@ -106,15 +133,19 @@ class Frontier(Protocol):
 
 
 class Fetcher(Protocol):
-    async def fetch(self, task: CrawlTask) -> FetchResult: ...
+    async def fetch(self, task: CrawlTask | ScrapeTask) -> FetchResult: ...
 
 
 class Renderer(Protocol):
-    async def render(self, task: CrawlTask) -> FetchResult: ...
+    async def render(self, task: CrawlTask | ScrapeTask) -> FetchResult: ...
 
 
 class Extractor(Protocol):
     def extract(self, result: FetchResult) -> ExtractedDoc | None: ...
+
+
+class RecordExtractor(Protocol):
+    def extract(self, result: FetchResult, spec: "ScrapeSpec") -> ScrapedRecord | None: ...
 
 
 class BlobStore(Protocol):

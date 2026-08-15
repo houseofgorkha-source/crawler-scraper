@@ -14,7 +14,7 @@ import time
 
 import httpx
 
-from .contracts import CrawlTask, FetchOutcome, FetchResult, RenderMode
+from .contracts import CrawlTask, FetchOutcome, FetchResult, RenderMode, ScrapeTask
 from .policy import USER_AGENT
 
 MAX_BODY_BYTES = 5 * 1024 * 1024
@@ -57,7 +57,7 @@ class HttpFetcher:
             http2=True,
         )
 
-    async def fetch(self, task: CrawlTask) -> FetchResult:
+    async def fetch(self, task: CrawlTask | ScrapeTask) -> FetchResult:
         started = time.perf_counter()
 
         # Conditional request: a 304 costs almost nothing and is the cheapest
