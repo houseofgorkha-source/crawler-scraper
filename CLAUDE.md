@@ -85,22 +85,30 @@ test_near_duplicate.py` now seeds a genuine near-duplicate pair
 dissimilar pair (distance 4) isn't flagged, that a row never matches
 itself, and that unlisted (`simhash IS NULL`) rows are never candidates.
 
-An automated test suite exists (`tests/`, see "Tests" below; 120 tests as
-of this writing) covering `normalize.py`, `extract.py`'s `simhash`/
-`hamming`/`HtmlExtractor`, `policy.py`'s robots parsing, `fetch.py`'s
-`needs_render()` heuristic, `scrape_extract.py`'s field extraction
-(nested/repeated/XPath), `CrawlWorker`/`ScrapeWorker`'s full `_handle()`
-orchestration (every terminal branch, mocked frontier/fetcher/renderer/
-extractor/store, no live infra), `Indexer._process()`'s near-dup routing,
-and — as integration tests against a dedicated database —
-`claim_urls()`/`claim_scrape_targets()`'s domain fairness, `SKIP LOCKED`
-concurrency, the shared politeness clock, `is_active` enforcement,
-`find_near_duplicate`, and `PostgresFrontier`'s round trips including both
+An automated test suite exists (`tests/`, see "Tests" below; 137 tests as
+of this writing) covering every module in `crawler/`: `normalize.py`,
+`extract.py`'s `simhash`/`hamming`/`HtmlExtractor`, `policy.py`'s robots
+parsing, `fetch.py`'s `needs_render()` heuristic, `scrape_extract.py`'s
+field extraction (nested/repeated/XPath), `store.py`'s key derivation and
+real zstd compress/decompress round trip (fake S3 client, no MinIO
+needed), `CrawlWorker`/`ScrapeWorker`'s full `_handle()` orchestration
+(every terminal branch, mocked frontier/fetcher/renderer/extractor/store),
+`Indexer._process()`'s near-dup routing, and — as integration tests
+against a dedicated database — `claim_urls()`/`claim_scrape_targets()`'s
+domain fairness, `SKIP LOCKED` concurrency, the shared politeness clock,
+`is_active` enforcement, `IndexerDB`'s full query surface including
+`find_near_duplicate`, `render.py`'s cross-process advisory-lock mechanism
+itself (acquire/release/reuse, the actual max_pages cap under contention
+between two renderer instances, and that a crashed holder's lock releases
+automatically — the same thing verified live earlier in this project,
+now automated), and `PostgresFrontier`'s round trips including both
 Crawler↔Scraper feed directions. Runs on every push/PR via GitHub Actions
-(`.github/workflows/tests.yml`). Still not covered: `render.py`'s
-advisory-lock mechanism itself (only ever verified live, not in the
-suite), `IndexerDB`'s own queries beyond `find_near_duplicate`, and
-`store.py`.
+(`.github/workflows/tests.yml`). Not covered: `worker.py`/`scrape_worker.py`
+tested only with mocks, never against live infra end-to-end in the suite
+(that's what the manual verification earlier in this project covered);
+`render.py`'s Playwright/Chromium interaction itself is untested (only
+the lock mechanism around it) since CI intentionally doesn't install
+browser binaries to stay fast.
 
 ## Non-negotiable design decisions (do not "simplify" these away)
 
@@ -314,9 +322,14 @@ export CRAWLER_TEST_REDIS_URL="redis://localhost:6379/15"   # isolated logical d
 python -m pytest
 ```
 
-`tests/unit/` needs no infrastructure (pure functions: `normalize.py`,
-`extract.py`, `policy.py`, `fetch.py`'s heuristic, `scrape_extract.py`).
-`tests/integration/` needs the test database above.
+`tests/unit/` needs no infrastructure at all -- pure functions
+(`normalize.py`, `extract.py`, `policy.py`, `fetch.py`'s heuristic,
+`scrape_extract.py`, `store.py` with a fake S3 client) plus
+`CrawlWorker`/`ScrapeWorker`/`Indexer` with every dependency mocked.
+`tests/integration/` needs the test database above (also used for
+`render.py`'s advisory-lock tests, since Postgres advisory locks are the
+whole mechanism under test there -- no Playwright/browser involved).
+Runs automatically on every push/PR via `.github/workflows/tests.yml`.
 
 ## Scale-out path (do not jump ahead of the current bottleneck)
 
