@@ -20,6 +20,7 @@ import uuid
 
 from .contracts import FetchOutcome, FetchResult
 from .fetch import HttpFetcher, needs_render
+from .metrics import FETCH_DURATION_SECONDS, SCRAPE_TASKS
 from .scrape_extract import HtmlRecordExtractor, ScrapeSpec
 
 log = logging.getLogger(__name__)
@@ -49,8 +50,13 @@ class ScrapeWorker:
             if not tasks:
                 await asyncio.sleep(IDLE_SLEEP)
                 continue
-            await asyncio.gather(*(self._handle(t) for t in tasks),
-                                 return_exceptions=True)
+            results = await asyncio.gather(*(self._handle(t) for t in tasks),
+                                           return_exceptions=True)
+            for task, result in zip(tasks, results):
+                if isinstance(result, Exception):
+                    log.error("unhandled error processing %s", task.url,
+                             exc_info=result)
+                    SCRAPE_TASKS.labels(outcome="unhandled_error").inc()
 
     def stop(self) -> None:
         self._running = False
@@ -61,11 +67,13 @@ class ScrapeWorker:
             policy = await self.frontier.refresh_robots(task.host)
         if not policy.check_allowed(task.url):
             await self.frontier.skip_scrape(task, reason="robots_denied")
+            SCRAPE_TASKS.labels(outcome="robots_denied").inc()
             return
 
         spec = await self.frontier.get_scrape_spec(task.spec_id)
         if spec is None:
             await self.frontier.skip_scrape(task, reason="spec_missing")
+            SCRAPE_TASKS.labels(outcome="spec_missing").inc()
             return
         # Re-checked here, not just at claim time, for the same reason
         # robots is re-checked at fetch time even though the claim query
@@ -73,6 +81,7 @@ class ScrapeWorker:
         # spec being deactivated in between.
         if not spec.is_active:
             await self.frontier.skip_scrape(task, reason="spec_inactive")
+            SCRAPE_TASKS.labels(outcome="spec_inactive").inc()
             return
 
         if spec.render_mode == "always" and self.renderer is None:
@@ -80,20 +89,27 @@ class ScrapeWorker:
             # spec asked for -- skip explicitly instead of downgrading to
             # a static fetch that would look like a normal success.
             await self.frontier.skip_scrape(task, reason="render_required_unavailable")
+            SCRAPE_TASKS.labels(outcome="render_required_unavailable").inc()
             return
 
         result = await self._fetch(task, spec)
+        FETCH_DURATION_SECONDS.labels(
+            subsystem="scraper", render_mode=result.render_mode.value
+        ).observe(result.duration_ms / 1000)
 
         if result.outcome is FetchOutcome.NOT_MODIFIED:
             await self.frontier.reschedule_scrape(task)
+            SCRAPE_TASKS.labels(outcome="not_modified").inc()
             return
         if result.outcome is not FetchOutcome.OK:
             await self.frontier.fail_scrape(task, result, max_failures=MAX_FAILURES)
+            SCRAPE_TASKS.labels(outcome=result.outcome.value).inc()
             return
 
         record = self.extractor.extract(result, spec)
         if record is None:
             await self.frontier.skip_scrape(task, reason="no_content")
+            SCRAPE_TASKS.labels(outcome="no_content").inc()
             return
 
         raw_key = None
@@ -101,6 +117,7 @@ class ScrapeWorker:
             raw_key = await self.store.put_raw(task.host, task.target_id, result.body)
 
         await self.frontier.complete_scrape(task, result, record, raw_key=raw_key)
+        SCRAPE_TASKS.labels(outcome="done").inc()
 
         if spec.feed_to_crawler and record.links:
             await self.frontier.feed_links_to_crawler(task.url, record.links)

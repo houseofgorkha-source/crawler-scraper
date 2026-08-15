@@ -23,6 +23,7 @@ import uuid
 from .contracts import FetchOutcome, FetchResult
 from .extract import HtmlExtractor
 from .fetch import HttpFetcher, needs_render
+from .metrics import CRAWL_TASKS, FETCH_DURATION_SECONDS
 from .render import PlaywrightRenderer
 
 log = logging.getLogger(__name__)
@@ -57,8 +58,13 @@ class CrawlWorker:
             if not tasks:
                 await asyncio.sleep(IDLE_SLEEP)
                 continue
-            await asyncio.gather(*(self._handle(t) for t in tasks),
-                                 return_exceptions=True)
+            results = await asyncio.gather(*(self._handle(t) for t in tasks),
+                                           return_exceptions=True)
+            for task, result in zip(tasks, results):
+                if isinstance(result, Exception):
+                    log.error("unhandled error processing %s", task.url,
+                             exc_info=result)
+                    CRAWL_TASKS.labels(outcome="unhandled_error").inc()
 
     def stop(self) -> None:
         self._running = False
@@ -71,21 +77,28 @@ class CrawlWorker:
             policy = await self.frontier.refresh_robots(task.host)
         if not policy.check_allowed(task.url):
             await self.frontier.skip(task, reason="robots_denied")
+            CRAWL_TASKS.labels(outcome="robots_denied").inc()
             return
 
         result = await self._fetch_with_escalation(task)
         await self.frontier.record_attempt(result, self.worker_id)
+        FETCH_DURATION_SECONDS.labels(
+            subsystem="crawler", render_mode=result.render_mode.value
+        ).observe(result.duration_ms / 1000)
 
         if result.outcome is FetchOutcome.NOT_MODIFIED:
             await self.frontier.reschedule(task, unchanged=True)
+            CRAWL_TASKS.labels(outcome="not_modified").inc()
             return
         if result.outcome is not FetchOutcome.OK:
             await self.frontier.fail(result, max_failures=MAX_FAILURES)
+            CRAWL_TASKS.labels(outcome=result.outcome.value).inc()
             return
 
         doc = self.extractor.extract(result)
         if doc is None:
             await self.frontier.skip(task, reason="no_content")
+            CRAWL_TASKS.labels(outcome="no_content").inc()
             return
 
         # Blob first, then the row that points at it.
@@ -93,6 +106,7 @@ class CrawlWorker:
         text_key = await self.store.put_text(task.host, task.url_id, doc.text)
 
         await self.frontier.complete(result, doc, raw_key=raw_key, text_key=text_key)
+        CRAWL_TASKS.labels(outcome="done").inc()
 
         if self.feed_scraper:
             # Best-effort: Scraper being unreachable/misconfigured must

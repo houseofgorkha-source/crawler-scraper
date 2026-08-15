@@ -26,6 +26,7 @@ import signal
 import asyncpg
 import redis.asyncio as aioredis
 import structlog
+from prometheus_client import start_http_server
 
 from .db import IndexerDB
 from .fetch import HttpFetcher
@@ -76,6 +77,15 @@ async def _blob_store() -> BlobStore:
     return BlobStore(client, S3_BUCKET)
 
 
+def _maybe_start_metrics(port: int | None) -> None:
+    # Opt-in, no default port: crawl/scrape/index commonly run as separate
+    # simultaneous processes, and a shared default port would collide the
+    # moment more than one of them is started with metrics on.
+    if port is not None:
+        start_http_server(port)
+        log.info("metrics_started", port=port)
+
+
 def _install_stop_handler(stop: asyncio.Event) -> None:
     # ProactorEventLoop (the asyncio default on Windows) does not implement
     # add_signal_handler; fall back to signal.signal there. Ctrl+C still
@@ -102,6 +112,7 @@ async def cmd_seed(args: argparse.Namespace) -> None:
 
 
 async def cmd_crawl(args: argparse.Namespace) -> None:
+    _maybe_start_metrics(args.metrics_port)
     pool = await _pool()
     redis = aioredis.from_url(REDIS_URL)
     frontier = PostgresFrontier(pool, redis, robots_fetcher=_fetch_robots)
@@ -148,6 +159,7 @@ async def cmd_crawl(args: argparse.Namespace) -> None:
 
 
 async def cmd_scrape(args: argparse.Namespace) -> None:
+    _maybe_start_metrics(args.metrics_port)
     pool = await _pool()
     redis = aioredis.from_url(REDIS_URL)
     frontier = PostgresFrontier(pool, redis, robots_fetcher=_fetch_robots)
@@ -237,6 +249,7 @@ async def cmd_spec_add(args: argparse.Namespace) -> None:
 async def cmd_index(args: argparse.Namespace) -> None:
     from meilisearch_python_sdk import AsyncClient
 
+    _maybe_start_metrics(args.metrics_port)
     pool = await _pool()
     db = IndexerDB(pool)
     store = await _blob_store()
@@ -289,6 +302,8 @@ def main() -> None:
                          help="disable the render tier entirely (static-only)")
     p_crawl.add_argument("--feed-scraper", action="store_true",
                          help="enroll crawled URLs into any matching active scrape spec")
+    p_crawl.add_argument("--metrics-port", type=int, default=None,
+                         help="expose Prometheus metrics on this port (off by default)")
     p_crawl.set_defaults(func=cmd_crawl)
 
     p_scrape = sub.add_parser("scrape", help="run scrape workers")
@@ -298,6 +313,8 @@ def main() -> None:
                                "with any running crawl process via Postgres advisory locks)")
     p_scrape.add_argument("--no-render", action="store_true",
                           help="disable the render tier entirely (static-only)")
+    p_scrape.add_argument("--metrics-port", type=int, default=None,
+                          help="expose Prometheus metrics on this port (off by default)")
     p_scrape.set_defaults(func=cmd_scrape)
 
     p_submit = sub.add_parser("submit-scrape", help="add explicit scrape targets under a spec")
@@ -312,6 +329,8 @@ def main() -> None:
     p_spec_add.set_defaults(func=cmd_spec_add)
 
     p_index = sub.add_parser("index", help="run the async indexer")
+    p_index.add_argument("--metrics-port", type=int, default=None,
+                         help="expose Prometheus metrics on this port (off by default)")
     p_index.set_defaults(func=cmd_index)
 
     p_reap = sub.add_parser("reap", help="run one lease-reap pass and exit (for cron)")
