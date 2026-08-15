@@ -1,0 +1,51 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: crawler_test
+          POSTGRES_PASSWORD: crawler
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Apply schema to the test database
+        run: PGPASSWORD=crawler psql -h localhost -U postgres -d crawler_test -f db/schema.sql
+
+      - name: Run tests
+        env:
+          CRAWLER_TEST_PG_DSN: postgresql://postgres:crawler@localhost/crawler_test
+          CRAWLER_TEST_REDIS_URL: redis://localhost:6379/15
+        run: python -m pytest -v
