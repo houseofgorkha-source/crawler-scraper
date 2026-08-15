@@ -3,6 +3,11 @@
 Broad-scope crawler. Medium scale (tens of millions of URLs) on one machine,
 with an evolution path to distributed that does not require rewriting the core.
 
+A Scraper -- structured, spec-driven field extraction -- is an equally
+first-class peer capability, added on top of this architecture rather than
+as a mode of the Crawler. See "Scraper" below; the diagram and decisions
+in this section describe the Crawler exactly as originally verified.
+
 ## Architecture
 
 ```
@@ -29,8 +34,8 @@ with an evolution path to distributed that does not require rewriting the core.
         │              needs_render()?  ──no──→ done   │
         │                        ↓ yes                 │
         │              ┌──────────────────┐            │
-        │              │ RENDER POOL      │  bounded   │
-        │              │ Playwright ≤4    │  semaphore │
+        │              │ RENDER POOL      │  bounded,  │
+        │              │ Playwright ≤4    │ cross-proc │
         │              └──────────────────┘            │
         └──────────────────────┬───────────────────────┘
                                ↓
@@ -88,7 +93,10 @@ of V1.
 **Rendering is escalation, not default.** Static fetch first, always. Escalate
 only on evidence (empty app-shell root, implausibly low text). Record that
 evidence on the domain so known SPAs stop paying the wasted round-trip. The
-render pool is a hard-capped semaphore — it is the intended bottleneck.
+render pool is hard-capped — it is the intended bottleneck. Enforced via
+Postgres session-scoped advisory locks rather than an in-process semaphore,
+since Crawler and Scraper are independently runnable processes that must
+share one real cap, not one each.
 
 **Indexing is asynchronous.** A flag on the row, drained by a separate
 process. Meilisearch being down produces a growing queue, not a stalled crawl.
@@ -102,8 +110,45 @@ crawlers get blocked by WAFs — this is a technical requirement, not etiquette.
 ## Explicitly deferred
 
 Go workers · Kafka · Kubernetes · OpenSearch · ML classification · graph
-ranking · multi-region. Each is addable without touching the core, because
-stages communicate only through the contracts in `crawler/contracts.py`.
+ranking · multi-region · general browser automation (form submission,
+sessions, interactive/multi-step flows). Each is addable without touching
+the core, because stages communicate only through the contracts in
+`crawler/contracts.py`.
+
+## Scraper
+
+A peer of the Crawler, not a mode of it: structured, spec-driven field
+extraction, added on top of the architecture above without changing it.
+The Crawler answers "what exists out there"; the Scraper answers "give me
+these specific fields from these specific pages."
+
+**Extraction**: CSS/XPath selectors against a JSON-shaped field schema
+(`crawler/scrape_extract.py`), with nested/repeated extraction for
+listing-style pages. Runs against the static or rendered DOM per spec
+(`render_mode: auto | always | never`). No form submission, sessions, or
+interactive flows — declarative, idempotent selectors only.
+
+**Storage**: `scrape_specs` / `scrape_targets` / `scraped_records`, a
+`claim_scrape_targets()` SQL function structurally identical to
+`claim_urls()` (same `LATERAL` + `FOR UPDATE SKIP LOCKED` pattern), gated
+on the *same* `domains.next_available_at`/robots fields as the Crawler —
+one shared politeness clock, never a second one. `scraped_records` is
+Postgres-only (no Meilisearch — structured field data isn't a full-text
+search problem) and durable (no pruning, unlike `crawl_attempts`).
+
+**Operating modes**: `crawl` and `scrape` are independently runnable
+processes. Two optional feed rules connect them — `crawl --feed-scraper`
+(Crawler → Scraper) and a spec's `feed_to_crawler` flag (Scraper →
+Crawler) — both off by default, so every combination (either alone, both
+together, either feeding the other) is just which processes are running
+and which flags are set, not different code.
+
+**Render pool**: shared across both processes via Postgres advisory
+locks — see "Rendering is escalation, not default" above.
+
+Verified against live infra: nested/repeated structured extraction from a
+listing page, and the Scraper → Crawler link-feed mechanism handing a
+discovered link to the Crawler's own frontier.
 
 ## Layout
 
@@ -119,6 +164,8 @@ crawler/extract.py     content, links, sha256 + simhash
 crawler/worker.py      the loop
 crawler/index.py       async Meilisearch drain
 crawler/store.py       object storage (zstd)
+crawler/scrape_extract.py  Scraper: CSS/XPath + JSON-schema extraction
+crawler/scrape_worker.py   Scraper: the loop (peer of worker.py)
 docker-compose.yml     single-machine infra
 ```
 
@@ -130,6 +177,11 @@ pip install -r requirements.txt && playwright install chromium
 python -m crawler.cli seed https://example.com
 python -m crawler.cli crawl --workers 8
 python -m crawler.cli index
+
+# Scraper -- independently runnable, same infra
+python -m crawler.cli spec add spec.json
+python -m crawler.cli submit-scrape <spec-name> https://example.com/p/1
+python -m crawler.cli scrape --workers 8
 ```
 
 ## Scale-out path
