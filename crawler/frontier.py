@@ -169,6 +169,16 @@ class PostgresFrontier:
         simhash_signed = doc.simhash - (1 << 64) if doc.simhash >= (1 << 63) else doc.simhash
         async with self.pool.acquire() as conn:
             async with conn.transaction():
+                # domains locked before urls here to match add()'s lock
+                # order (domain row, then url row, per discovered link) --
+                # complete() and add() run concurrently from different
+                # workers, so a consistent cross-function lock order is
+                # what avoids an AB-BA deadlock between them, not just
+                # consistency within add() alone.
+                await conn.execute(
+                    "UPDATE domains SET pages_crawled = pages_crawled + 1 WHERE host = $1",
+                    result.task.host,
+                )
                 await conn.execute(
                     f"""UPDATE urls SET
                             status = 'done', lease_owner = NULL, lease_expires_at = NULL,
@@ -193,10 +203,6 @@ class PostgresFrontier:
                            index_state = 'pending', updated_at = now()""",
                     result.task.url_id, doc.title, doc.description, doc.lang,
                     doc.word_count, raw_key, text_key,
-                )
-                await conn.execute(
-                    "UPDATE domains SET pages_crawled = pages_crawled + 1 WHERE host = $1",
-                    result.task.host,
                 )
 
     async def reschedule(self, task: CrawlTask, unchanged: bool) -> None:
@@ -243,6 +249,34 @@ class PostgresFrontier:
     # Discovery
     # ------------------------------------------------------------------ #
     async def add(self, links: list[DiscoveredLink], from_url_id: int, depth: int) -> int:
+        inserted = 0
+        # Concurrent calls to add() from different worker pages routinely
+        # share domains (google.com, facebook.com, ...) but encounter them
+        # in different orders (whatever order they appear in each page's
+        # DOM). Locking domain rows in per-link order let two transactions
+        # take the same two domain locks in opposite order -> deadlock
+        # (DeadlockDetectedError under concurrent workers). Sorting by host
+        # first makes lock acquisition order deterministic and consistent
+        # across every concurrent transaction, which removes that cycle --
+        # but not the residual case where two transactions race to INSERT
+        # the *same brand-new* domain for the first time, which Postgres
+        # itself documents as something applications must retry rather
+        # than something lock ordering can prevent. add() runs after
+        # complete() has already committed (worker.py), so on an unretried
+        # failure here the page is marked done but its discovered links
+        # are simply gone -- silent loss of graph edges, which is exactly
+        # what this project's links table exists to avoid.
+        links = sorted(links, key=lambda l: registrable_host(l.url) or "")
+        for attempt in range(3):
+            try:
+                inserted = await self._add_once(links, from_url_id, depth)
+                break
+            except asyncpg.exceptions.DeadlockDetectedError:
+                if attempt == 2:
+                    raise
+        return inserted
+
+    async def _add_once(self, links: list[DiscoveredLink], from_url_id: int, depth: int) -> int:
         inserted = 0
         async with self.pool.acquire() as conn:
             async with conn.transaction():
