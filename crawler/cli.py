@@ -2,14 +2,23 @@
 CLI entrypoint.
 
     python -m crawler.cli seed https://example.com https://other.org
-    python -m crawler.cli crawl --workers 8
+    python -m crawler.cli crawl --workers 8 [--feed-scraper]
     python -m crawler.cli index
     python -m crawler.cli reap        # normally run from cron, see below
+
+    python -m crawler.cli spec add spec.json
+    python -m crawler.cli submit-scrape <spec-name> https://example.com/p/1 ...
+    python -m crawler.cli scrape --workers 8
+
+crawl and scrape are independently runnable processes -- run either alone,
+both together, or wire one to feed the other (--feed-scraper on crawl,
+feed_to_crawler in the spec). See CLAUDE.md for the five operating modes.
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import signal
@@ -23,6 +32,7 @@ from .fetch import HttpFetcher
 from .frontier import PostgresFrontier
 from .index import Indexer, SETTINGS
 from .render import PlaywrightRenderer
+from .scrape_worker import ScrapeWorker
 from .store import BlobStore
 from .worker import CrawlWorker
 
@@ -99,11 +109,12 @@ async def cmd_crawl(args: argparse.Namespace) -> None:
 
     renderer = None
     if not args.no_render:
-        renderer = PlaywrightRenderer(max_pages=args.render_pages)
+        renderer = PlaywrightRenderer(PG_DSN, max_pages=args.render_pages)
         await renderer.start()
 
     workers = [
-        CrawlWorker(frontier, store, renderer=renderer, worker_id=f"w{i}")
+        CrawlWorker(frontier, store, renderer=renderer, worker_id=f"w{i}",
+                    feed_scraper=args.feed_scraper)
         for i in range(args.workers)
     ]
 
@@ -136,6 +147,93 @@ async def cmd_crawl(args: argparse.Namespace) -> None:
     await pool.close()
 
 
+async def cmd_scrape(args: argparse.Namespace) -> None:
+    pool = await _pool()
+    redis = aioredis.from_url(REDIS_URL)
+    frontier = PostgresFrontier(pool, redis, robots_fetcher=_fetch_robots)
+    store = await _blob_store()
+
+    renderer = None
+    if not args.no_render:
+        renderer = PlaywrightRenderer(PG_DSN, max_pages=args.render_pages)
+        await renderer.start()
+
+    workers = [
+        ScrapeWorker(frontier, store, renderer=renderer, worker_id=f"s{i}")
+        for i in range(args.workers)
+    ]
+
+    stop = asyncio.Event()
+    _install_stop_handler(stop)
+
+    async def reaper_loop():
+        while not stop.is_set():
+            async with pool.acquire() as conn:
+                n = await conn.fetchval("SELECT reap_expired_scrape_leases()")
+            if n:
+                log.info("reaped_scrape_leases", count=n)
+            await asyncio.sleep(60)
+
+    tasks = [asyncio.create_task(w.run()) for w in workers]
+    tasks.append(asyncio.create_task(reaper_loop()))
+
+    log.info("scrape_started", workers=args.workers, render=not args.no_render)
+    await stop.wait()
+
+    log.info("shutting_down")
+    for w in workers:
+        w.stop()
+    for t in tasks:
+        t.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    if renderer:
+        await renderer.aclose()
+    await redis.aclose()
+    await pool.close()
+
+
+async def cmd_submit_scrape(args: argparse.Namespace) -> None:
+    pool = await _pool()
+    async with pool.acquire() as conn:
+        spec_id = await conn.fetchval(
+            "SELECT id FROM scrape_specs WHERE name = $1 ORDER BY version DESC LIMIT 1",
+            args.spec,
+        )
+    if spec_id is None:
+        log.error("unknown_spec", spec=args.spec)
+        await pool.close()
+        return
+    redis = aioredis.from_url(REDIS_URL)
+    frontier = PostgresFrontier(pool, redis, robots_fetcher=_fetch_robots)
+    n = await frontier.submit_scrape_targets(spec_id, args.urls)
+    log.info("submitted_scrape_targets", spec=args.spec, requested=len(args.urls), inserted=n)
+    await redis.aclose()
+    await pool.close()
+
+
+async def cmd_spec_add(args: argparse.Namespace) -> None:
+    with open(args.file, "r", encoding="utf-8") as f:
+        spec = json.load(f)
+
+    pool = await _pool()
+    redis = aioredis.from_url(REDIS_URL)
+    frontier = PostgresFrontier(pool, redis, robots_fetcher=_fetch_robots)
+    spec_id = await frontier.register_spec(
+        name=spec["name"],
+        fields=spec["fields"],
+        version=spec.get("version", 1),
+        render_mode=spec.get("render_mode", "auto"),
+        link_field=spec.get("link_field"),
+        feed_to_crawler=spec.get("feed_to_crawler", False),
+        feed_from_crawler=spec.get("feed_from_crawler", False),
+        host_pattern=spec.get("host_pattern"),
+        path_regex=spec.get("path_regex"),
+    )
+    log.info("spec_registered", name=spec["name"], version=spec.get("version", 1), id=spec_id)
+    await redis.aclose()
+    await pool.close()
+
+
 async def cmd_index(args: argparse.Namespace) -> None:
     from meilisearch_python_sdk import AsyncClient
 
@@ -164,7 +262,8 @@ async def cmd_reap(args: argparse.Namespace) -> None:
     pool = await _pool()
     async with pool.acquire() as conn:
         n = await conn.fetchval("SELECT reap_expired_leases()")
-    log.info("reaped_leases", count=n)
+        n_scrape = await conn.fetchval("SELECT reap_expired_scrape_leases()")
+    log.info("reaped_leases", count=n, scrape_count=n_scrape)
     await pool.close()
 
 
@@ -188,7 +287,29 @@ def main() -> None:
                          help="max concurrent Playwright pages")
     p_crawl.add_argument("--no-render", action="store_true",
                          help="disable the render tier entirely (static-only)")
+    p_crawl.add_argument("--feed-scraper", action="store_true",
+                         help="enroll crawled URLs into any matching active scrape spec")
     p_crawl.set_defaults(func=cmd_crawl)
+
+    p_scrape = sub.add_parser("scrape", help="run scrape workers")
+    p_scrape.add_argument("--workers", type=int, default=8)
+    p_scrape.add_argument("--render-pages", type=int, default=4,
+                          help="max concurrent Playwright pages (shared cross-process "
+                               "with any running crawl process via Postgres advisory locks)")
+    p_scrape.add_argument("--no-render", action="store_true",
+                          help="disable the render tier entirely (static-only)")
+    p_scrape.set_defaults(func=cmd_scrape)
+
+    p_submit = sub.add_parser("submit-scrape", help="add explicit scrape targets under a spec")
+    p_submit.add_argument("spec", help="registered spec name")
+    p_submit.add_argument("urls", nargs="+")
+    p_submit.set_defaults(func=cmd_submit_scrape)
+
+    p_spec = sub.add_parser("spec", help="manage scrape specs")
+    spec_sub = p_spec.add_subparsers(dest="spec_command", required=True)
+    p_spec_add = spec_sub.add_parser("add", help="register a scrape spec from a JSON file")
+    p_spec_add.add_argument("file", help="path to a spec JSON file")
+    p_spec_add.set_defaults(func=cmd_spec_add)
 
     p_index = sub.add_parser("index", help="run the async indexer")
     p_index.set_defaults(func=cmd_index)
