@@ -62,9 +62,9 @@ class ScrapeWorker:
         self._running = False
 
     async def _handle(self, task) -> None:
-        policy = await self.frontier.policy_for(task.host)
+        policy = await self.frontier.policy_for(task.host, task.url)
         if policy.is_stale:
-            policy = await self.frontier.refresh_robots(task.host)
+            policy = await self.frontier.refresh_robots(task.host, task.url)
         if not policy.check_allowed(task.url):
             await self.frontier.skip_scrape(task, reason="robots_denied")
             SCRAPE_TASKS.labels(outcome="robots_denied").inc()

@@ -7,9 +7,14 @@ isolating it keeps test runs deterministic regardless).
 The `frontier` fixture itself lives in tests/conftest.py, shared with the
 live worker integration tests.
 """
+import redis.asyncio as aioredis
+
 from crawler.contracts import (
     DiscoveredLink, ExtractedDoc, FetchOutcome, FetchResult, RenderMode, CrawlTask,
 )
+from crawler.frontier import PostgresFrontier
+
+from ..conftest import TEST_REDIS_URL
 
 
 def _doc(url_id: int, links=()) -> ExtractedDoc:
@@ -190,3 +195,53 @@ async def test_feed_links_to_crawler_dedups_existing_origin(frontier, db):
             "SELECT count(*) FROM urls WHERE url = 'https://z.example/scraped-only'"
         )
     assert count == 1  # not duplicated
+
+
+async def test_refresh_robots_preserves_port_in_origin_not_in_domain_key(db):
+    """A non-standard-port URL must resolve robots.txt against its own
+    authority (port included), while the domains row it's cached under
+    stays keyed by the registrable, port-free host -- the same shared
+    politeness key the Crawler and Scraper both gate on."""
+    calls = []
+
+    async def spy_fetcher(host, origin=None):
+        calls.append((host, origin))
+        return None, 404  # no restrictions
+
+    redis_client = aioredis.from_url(TEST_REDIS_URL)
+    await redis_client.flushdb()
+    frontier = PostgresFrontier(db, redis_client, robots_fetcher=spy_fetcher)
+    try:
+        policy = await frontier.refresh_robots(
+            "127.0.0.1", "http://127.0.0.1:51127/products.html"
+        )
+    finally:
+        await redis_client.aclose()
+
+    assert calls == [("127.0.0.1", "http://127.0.0.1:51127")]
+    assert policy.is_crawlable
+
+    async with db.acquire() as conn:
+        row = await conn.fetchrow("SELECT host FROM domains WHERE host = $1", "127.0.0.1")
+    assert row["host"] == "127.0.0.1"  # politeness key stays port-free
+
+
+async def test_refresh_robots_without_url_omits_origin(db):
+    """No task URL available (e.g. a bare-host caller) -- the fetcher gets
+    no origin and falls back to its own https/http guess, matching
+    pre-existing behavior for callers that only have a host."""
+    calls = []
+
+    async def spy_fetcher(host, origin=None):
+        calls.append((host, origin))
+        return None, 404
+
+    redis_client = aioredis.from_url(TEST_REDIS_URL)
+    await redis_client.flushdb()
+    frontier = PostgresFrontier(db, redis_client, robots_fetcher=spy_fetcher)
+    try:
+        await frontier.refresh_robots("example.com")
+    finally:
+        await redis_client.aclose()
+
+    assert calls == [("example.com", None)]

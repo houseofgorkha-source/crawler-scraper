@@ -82,3 +82,23 @@ def registrable_host(url: str) -> str | None:
         return None
     h = h.lower()
     return h[4:] if h.startswith("www.") else h
+
+
+def robots_origin(url: str) -> str | None:
+    """scheme://authority (with a non-default port preserved) for fetching
+    robots.txt against the exact server a URL is actually served from.
+
+    Deliberately separate from registrable_host(): that one intentionally
+    drops scheme/port so politeness grouping and rate limiting stay per
+    hostname. This one exists because robots.txt itself is scoped per
+    origin (RFC 9309) -- a host on a non-standard port (or over plain
+    HTTP) has its own robots.txt that only the real origin can serve.
+    """
+    parts = urlsplit(url)
+    scheme = parts.scheme.lower()
+    if scheme not in ("http", "https") or not parts.hostname:
+        return None
+    netloc = parts.hostname.lower()
+    if parts.port and str(parts.port) != _DEFAULT_PORTS.get(scheme):
+        netloc = f"{netloc}:{parts.port}"
+    return f"{scheme}://{netloc}"

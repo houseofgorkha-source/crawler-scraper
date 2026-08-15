@@ -70,7 +70,7 @@ async def test_stale_policy_triggers_refresh():
 
     await worker._handle(_task())
 
-    frontier.refresh_robots.assert_awaited_once_with("example.com")
+    frontier.refresh_robots.assert_awaited_once_with("example.com", "https://example.com/p")
 
 
 async def test_not_modified_reschedules_without_extraction():

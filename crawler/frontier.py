@@ -19,7 +19,7 @@ from .contracts import (
     CrawlTask, DiscoveredLink, ExtractedDoc, FetchOutcome, FetchResult,
     ScrapedRecord, ScrapeTask,
 )
-from .normalize import normalize, registrable_host
+from .normalize import normalize, registrable_host, robots_origin
 from .policy import DomainPolicy, parse_robots, DEFAULT_CRAWL_DELAY_MS
 from .scrape_extract import ScrapeSpec, spec_from_row
 
@@ -67,16 +67,16 @@ class PostgresFrontier:
     # ------------------------------------------------------------------ #
     # Policy — cached in Redis, durable in Postgres, re-resolved on staleness
     # ------------------------------------------------------------------ #
-    async def policy_for(self, host: str) -> DomainPolicy:
+    async def policy_for(self, host: str, url: str | None = None) -> DomainPolicy:
         # The Redis entry is only a cheap staleness/short-circuit signal
         # (is_crawlable, delay) for logging and metrics. check_allowed()
         # needs the actual robots rule set, which only Postgres carries, so
         # every call still resolves a real DomainPolicy with a parser.
         # This keeps the cache honest: it can never be mistaken for the
         # authoritative answer used to gate a fetch.
-        return await self._load_from_db_or_refresh(host)
+        return await self._load_from_db_or_refresh(host, url)
 
-    async def _load_from_db_or_refresh(self, host: str) -> DomainPolicy:
+    async def _load_from_db_or_refresh(self, host: str, url: str | None = None) -> DomainPolicy:
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
                 """SELECT robots_body, robots_status, robots_fetched_at, crawl_delay_ms,
@@ -89,13 +89,20 @@ class PostgresFrontier:
                 policy = parse_robots(host, row["robots_body"], row["robots_status"] or 200)
                 await self._cache_policy(policy)
                 return policy
-        return await self.refresh_robots(host)
+        return await self.refresh_robots(host, url)
 
-    async def refresh_robots(self, host: str) -> DomainPolicy:
+    async def refresh_robots(self, host: str, url: str | None = None) -> DomainPolicy:
         if self._robots_fetcher is None:
             raise RuntimeError("no robots_fetcher configured on frontier")
 
-        body, status = await self._robots_fetcher(host)
+        # `host` is the registrable, scheme/port-free politeness key -- shared
+        # by design (see CLAUDE.md) so rate limiting never splits per
+        # subsystem. robots.txt itself is scoped per origin, though: a
+        # non-standard-port or plain-HTTP target needs the real scheme and
+        # port to resolve the right robots.txt, so that's derived fresh
+        # from the actual URL being crawled, never from `host` alone.
+        origin = robots_origin(url) if url else None
+        body, status = await self._robots_fetcher(host, origin)
         policy = parse_robots(host, body, status)
 
         async with self.pool.acquire() as conn:

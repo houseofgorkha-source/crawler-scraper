@@ -30,7 +30,7 @@ TEST_REDIS_URL = os.environ.get("CRAWLER_TEST_REDIS_URL", "redis://localhost:637
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
 
-async def allow_all_robots(host):
+async def allow_all_robots(host, origin=None):
     return None, 404  # 404 -> no restrictions, crawlable
 
 _TABLES = (

@@ -72,9 +72,9 @@ class CrawlWorker:
     async def _handle(self, task) -> None:
         # Second robots enforcement point. The claim query already gated on
         # domain policy, but that read may be minutes stale.
-        policy = await self.frontier.policy_for(task.host)
+        policy = await self.frontier.policy_for(task.host, task.url)
         if policy.is_stale:
-            policy = await self.frontier.refresh_robots(task.host)
+            policy = await self.frontier.refresh_robots(task.host, task.url)
         if not policy.check_allowed(task.url):
             await self.frontier.skip(task, reason="robots_denied")
             CRAWL_TASKS.labels(outcome="robots_denied").inc()

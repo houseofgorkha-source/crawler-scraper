@@ -50,12 +50,30 @@ MEILI_KEY = os.environ.get("CRAWLER_MEILI_KEY", "devkey")
 S3_BUCKET = os.environ.get("CRAWLER_S3_BUCKET", "crawler")
 
 
-async def _fetch_robots(host: str) -> tuple[str | None, int]:
+async def _fetch_robots(host: str, origin: str | None = None) -> tuple[str | None, int]:
     fetcher = HttpFetcher()
     try:
-        from .contracts import CrawlTask
-        result = await fetcher.fetch(CrawlTask(url_id=-1, url=f"https://{host}/robots.txt",
-                                                host=host, depth=0))
+        from .contracts import CrawlTask, FetchOutcome
+
+        async def _get(scheme_authority: str):
+            return await fetcher.fetch(CrawlTask(
+                url_id=-1, url=f"{scheme_authority}/robots.txt", host=host, depth=0))
+
+        if origin is not None:
+            # The caller (frontier.refresh_robots) resolved this from the
+            # actual URL being crawled, so it already carries the right
+            # scheme and port -- no guessing needed.
+            result = await _get(origin)
+        else:
+            # No source URL available (e.g. a bare host with no task
+            # context). https is the correct default for real hosts, but a
+            # plain-HTTP-only target has no TLS listener at all, so that
+            # attempt fails at the connection level, not with an HTTP
+            # error -- only then retry over http.
+            result = await _get(f"https://{host}")
+            if result.outcome is FetchOutcome.NETWORK_ERROR:
+                result = await _get(f"http://{host}")
+
         if result.has_body:
             return result.body.decode("utf-8", "replace"), result.status_code
         return None, result.status_code or 599

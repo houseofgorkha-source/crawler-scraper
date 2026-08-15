@@ -1,4 +1,4 @@
-from crawler.normalize import normalize, registrable_host
+from crawler.normalize import normalize, registrable_host, robots_origin
 
 
 def test_strips_default_https_port():
@@ -79,3 +79,32 @@ def test_registrable_host_strips_www_and_port():
 
 def test_registrable_host_none_for_hostless():
     assert registrable_host("mailto:a@b.com") is None
+
+
+def test_robots_origin_keeps_non_default_port():
+    assert robots_origin("http://127.0.0.1:51127/products.html") == "http://127.0.0.1:51127"
+
+
+def test_robots_origin_strips_default_port():
+    assert robots_origin("https://example.com:443/page") == "https://example.com"
+    assert robots_origin("http://example.com:80/page") == "http://example.com"
+
+
+def test_robots_origin_preserves_actual_scheme():
+    assert robots_origin("http://example.com/page") == "http://example.com"
+    assert robots_origin("https://example.com/page") == "https://example.com"
+
+
+def test_robots_origin_keeps_www_unlike_registrable_host():
+    # robots.txt is fetched from the exact server the URL names -- unlike
+    # registrable_host(), which intentionally aliases www for politeness
+    # grouping, this must not silently change which origin gets hit.
+    assert robots_origin("https://www.example.com/page") == "https://www.example.com"
+
+
+def test_robots_origin_none_for_non_http_scheme():
+    assert robots_origin("mailto:a@b.com") is None
+
+
+def test_robots_origin_none_for_hostless():
+    assert robots_origin("https:///path") is None
