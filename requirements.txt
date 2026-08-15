@@ -1,5 +1,9 @@
 # Fetch + concurrency
 httpx[http2]==0.27.2
+# fetch.py advertises "br" in Accept-Encoding; httpx only decodes brotli
+# responses if this is installed, otherwise it silently returns the raw
+# compressed bytes as if the fetch succeeded.
+brotli==1.1.0
 # Parsing (selectolax is ~10x lxml on the parse-and-discard workload)
 selectolax==0.3.21
 # Escalation tier only
