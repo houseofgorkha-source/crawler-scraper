@@ -14,6 +14,8 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from meilisearch_python_sdk.models.settings import MeilisearchSettings
+
 from .extract import hamming
 
 log = logging.getLogger(__name__)
@@ -76,9 +78,9 @@ class Indexer:
         await self.db.mark_indexed([d["id"] for d in payload])
 
 
-SETTINGS = {
-    "searchableAttributes": ["title", "description", "content"],
-    "filterableAttributes": ["lang"],
-    "displayedAttributes": ["id", "url", "title", "description", "lang"],
-    "rankingRules": ["words", "typo", "proximity", "attribute", "exactness"],
-}
+SETTINGS = MeilisearchSettings(
+    searchable_attributes=["title", "description", "content"],
+    filterable_attributes=["lang"],
+    displayed_attributes=["id", "url", "title", "description", "lang"],
+    ranking_rules=["words", "typo", "proximity", "attribute", "exactness"],
+)
