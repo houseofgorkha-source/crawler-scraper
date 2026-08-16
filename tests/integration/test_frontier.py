@@ -373,3 +373,49 @@ async def test_refresh_robots_without_url_omits_origin(db):
         await redis_client.aclose()
 
     assert calls == [("example.com", None)]
+
+
+async def test_policy_for_survives_redis_outage(db):
+    """Redis is a cache only (CLAUDE.md: "Postgres is the source of truth
+    ... do not make anything durable depend on Redis"), but
+    _cache_policy() used to call redis.set() unconditionally on every
+    policy_for() call -- including the Postgres-cache-hit path, not just a
+    genuine refresh -- with no error handling. A Redis outage propagated
+    out of policy_for(), which worker.py calls as the first step of every
+    task; since the failure landed before frontier.fail()/skip()/complete(),
+    the lease just sat until reap timeout and reclaimed into the same
+    failure again, forever, with none of the normal backoff -- a Redis
+    blip silently stalled the whole crawl instead of merely losing a
+    cache. Point the frontier at a connection that can never succeed
+    (an unroutable address, not just a wrong port -- a wrong port can
+    still fail fast with connection-refused; TEST-NET-1 guarantees a
+    connect timeout, the same failure mode a real network partition
+    produces) to reproduce the outage deterministically, and prove both
+    the fresh-refresh path and the cache-hit path complete anyway."""
+    async def robots_fetcher(host, origin=None):
+        return "User-agent: *\nDisallow: /blocked\n", 200
+
+    unreachable_redis = aioredis.from_url(
+        "redis://192.0.2.1:6379/0", socket_connect_timeout=1, socket_timeout=1,
+    )
+    frontier = PostgresFrontier(db, unreachable_redis, robots_fetcher=robots_fetcher)
+
+    # Fresh-refresh path (no Postgres row yet for this host).
+    policy = await frontier.policy_for("redis-outage.example", "http://redis-outage.example/p")
+    assert policy.is_crawlable is True
+    assert policy.check_allowed("http://redis-outage.example/p") is True
+    assert policy.check_allowed("http://redis-outage.example/blocked") is False
+
+    # Postgres-cache-hit path -- the row now exists and is fresh, so this
+    # call takes the OTHER branch that also used to touch Redis unguarded.
+    policy2 = await frontier.policy_for("redis-outage.example", "http://redis-outage.example/p")
+    assert policy2.is_crawlable is True
+    assert policy2.check_allowed("http://redis-outage.example/blocked") is False
+
+    # And the rest of the frontier (which never touched Redis) is
+    # unaffected, proving Postgres-backed progress continues normally.
+    await frontier.seed(["http://redis-outage.example/p"])
+    tasks = await frontier.claim("w1", 5, 300)
+    assert len(tasks) == 1
+
+    await unreachable_redis.aclose()

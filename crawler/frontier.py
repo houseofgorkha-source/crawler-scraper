@@ -123,15 +123,28 @@ class PostgresFrontier:
         return policy
 
     async def _cache_policy(self, policy: DomainPolicy) -> None:
-        await self.redis.set(
-            f"robots:{policy.host}",
-            json.dumps({
-                "is_crawlable": policy.is_crawlable,
-                "crawl_delay_ms": policy.crawl_delay_ms,
-                "fetched_at": policy.fetched_at.isoformat() if policy.fetched_at else None,
-            }),
-            ex=ROBOTS_CACHE_TTL,
-        )
+        # This is a cache write of a fact Postgres already holds durably --
+        # per "Redis is a cache only", losing it must never take the
+        # Postgres-backed policy result down with it. Without this guard, a
+        # Redis outage propagated out of policy_for() (called on the first
+        # line of every worker task, cache hits included -- see
+        # _load_from_db_or_refresh) and stalled the crawl entirely: the
+        # failure landed before frontier.fail()/skip()/complete(), so leases
+        # just sat until reap timeout and reclaimed into the same failure,
+        # forever, with none of the normal backoff.
+        try:
+            await self.redis.set(
+                f"robots:{policy.host}",
+                json.dumps({
+                    "is_crawlable": policy.is_crawlable,
+                    "crawl_delay_ms": policy.crawl_delay_ms,
+                    "fetched_at": policy.fetched_at.isoformat() if policy.fetched_at else None,
+                }),
+                ex=ROBOTS_CACHE_TTL,
+            )
+        except aioredis.RedisError:
+            log.warning("robots_cache_write_failed host=%s -- Postgres remains authoritative",
+                        policy.host)
 
     async def mark_js_required(self, host: str) -> None:
         async with self.pool.acquire() as conn:
