@@ -122,6 +122,28 @@ async def test_success_writes_blob_before_completing():
     assert kwargs["text_key"] == "text/k"
 
 
+async def test_blob_store_failure_routes_through_fail_not_uncaught():
+    """store.put_raw()/put_text() used to be uncaught: an exception (e.g.
+    MinIO down) propagated straight out of _handle(), skipping
+    frontier.fail() entirely, so the lease just sat until the reap
+    timeout and retried at a fixed, unbackoff'd cadence forever -- wasting
+    a real fetch against the target site on every retry, with no
+    MAX_FAILURES retirement. It must be caught and routed through the same
+    fail()/backoff path as any other fetch failure, not left to complete()
+    (which would otherwise commit a row pointing at content that was
+    never actually stored)."""
+    worker, frontier, fetcher, extractor, store = _worker()
+    store.put_raw.side_effect = ConnectionError("storage unreachable")
+
+    await worker._handle(_task())
+
+    frontier.fail.assert_awaited_once()
+    frontier.complete.assert_not_awaited()
+    (result,), kwargs = frontier.fail.call_args
+    assert result.outcome is FetchOutcome.STORAGE_ERROR
+    assert result.task.url_id == 1
+
+
 async def test_discovered_links_added_at_depth_plus_one():
     worker, frontier, fetcher, extractor, store = _worker()
     links = [DiscoveredLink(url="https://example.com/other")]

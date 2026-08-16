@@ -27,6 +27,7 @@ class FetchOutcome(str, Enum):
     NETWORK_ERROR = "network_error"
     NON_HTML = "non_html"
     TOO_LARGE = "too_large"
+    STORAGE_ERROR = "storage_error"   # blob store write failed after a successful fetch
 
 
 # --------------------------------------------------------------------------

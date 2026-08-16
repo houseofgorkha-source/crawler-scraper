@@ -15,6 +15,7 @@ feeding the crawl frontier.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import uuid
 
@@ -112,9 +113,22 @@ class ScrapeWorker:
             SCRAPE_TASKS.labels(outcome="no_content").inc()
             return
 
+        # Same reasoning as CrawlWorker: a failed blob write must not be
+        # silently ignored (complete_scrape() would commit a record whose
+        # raw_key points at content that was never stored) or left as an
+        # uncaught exception (which skips fail_scrape()'s backoff/
+        # MAX_FAILURES entirely, retrying at a fixed cadence forever).
         raw_key = None
         if result.body:
-            raw_key = await self.store.put_raw(task.host, task.target_id, result.body)
+            try:
+                raw_key = await self.store.put_raw(task.host, task.target_id, result.body)
+            except Exception:
+                log.exception("blob store write failed for %s", task.url)
+                await self.frontier.fail_scrape(
+                    task, dataclasses.replace(result, outcome=FetchOutcome.STORAGE_ERROR),
+                    max_failures=MAX_FAILURES)
+                SCRAPE_TASKS.labels(outcome="storage_error").inc()
+                return
 
         await self.frontier.complete_scrape(task, result, record, raw_key=raw_key)
         SCRAPE_TASKS.labels(outcome="done").inc()

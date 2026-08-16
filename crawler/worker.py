@@ -17,6 +17,7 @@ separate process. Search being down must not stop the crawl.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import uuid
 
@@ -101,9 +102,24 @@ class CrawlWorker:
             CRAWL_TASKS.labels(outcome="no_content").inc()
             return
 
-        # Blob first, then the row that points at it.
-        raw_key = await self.store.put_raw(task.host, task.url_id, result.body)
-        text_key = await self.store.put_text(task.host, task.url_id, doc.text)
+        # Blob first, then the row that points at it. Unlike Redis, object
+        # storage is durable required state, not a cache -- a failed write
+        # must not be silently ignored (that would let complete() commit a
+        # row pointing at content that was never stored). It also must not
+        # be left as an uncaught exception: that skipped frontier.fail()
+        # entirely, leaving the lease to sit until reap timeout and retry
+        # at a fixed, unbackoff'd cadence forever -- wasting a real fetch
+        # against the target site on every retry. Route it through the
+        # same fail()/backoff/MAX_FAILURES path as any other fetch failure.
+        try:
+            raw_key = await self.store.put_raw(task.host, task.url_id, result.body)
+            text_key = await self.store.put_text(task.host, task.url_id, doc.text)
+        except Exception:
+            log.exception("blob store write failed for %s", task.url)
+            await self.frontier.fail(dataclasses.replace(result, outcome=FetchOutcome.STORAGE_ERROR),
+                                     max_failures=MAX_FAILURES)
+            CRAWL_TASKS.labels(outcome="storage_error").inc()
+            return
 
         await self.frontier.complete(result, doc, raw_key=raw_key, text_key=text_key)
         CRAWL_TASKS.labels(outcome="done").inc()

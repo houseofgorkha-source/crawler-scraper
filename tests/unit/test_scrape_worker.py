@@ -161,6 +161,25 @@ async def test_success_completes_with_extracted_record():
     frontier.complete_scrape.assert_awaited_once()
 
 
+async def test_blob_store_failure_routes_through_fail_scrape_not_uncaught():
+    """Same reasoning as CrawlWorker's equivalent test: store.put_raw()
+    used to be uncaught, skipping fail_scrape()'s backoff/MAX_FAILURES
+    path entirely and leaving the lease to retry at a fixed cadence
+    forever. It must route through fail_scrape() instead of
+    complete_scrape() (which would otherwise commit a record whose
+    raw_key points at content that was never stored)."""
+    worker, frontier, fetcher, extractor, store = _worker()
+    store.put_raw.side_effect = ConnectionError("storage unreachable")
+
+    await worker._handle(_task())
+
+    frontier.fail_scrape.assert_awaited_once()
+    frontier.complete_scrape.assert_not_awaited()
+    (task, result), kwargs = frontier.fail_scrape.call_args
+    assert result.outcome is FetchOutcome.STORAGE_ERROR
+    assert task.target_id == 1
+
+
 async def test_feed_to_crawler_off_does_not_feed():
     worker, frontier, fetcher, extractor, store = _worker()
     frontier.get_scrape_spec.return_value = _spec(feed_to_crawler=False)
