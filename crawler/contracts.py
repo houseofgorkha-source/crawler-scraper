@@ -54,6 +54,8 @@ class FetchResult:
     outcome: FetchOutcome
     status_code: int | None = None
     final_url: str | None = None            # after redirects; may differ from task.url
+    headers: dict[str, str] = field(default_factory=dict)
+    challenge_type: str | None = None
     body: bytes | None = None
     content_type: str | None = None
     encoding: str | None = None

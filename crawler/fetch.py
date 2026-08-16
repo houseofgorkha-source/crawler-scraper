@@ -34,6 +34,45 @@ _APP_SHELL_RE = re.compile(
 
 MIN_STATIC_TEXT = 400   # chars of visible text below which we suspect a shell
 
+def classify_http_error(status_code: int) -> str:
+    """Classify an HTTP error without changing fetch behavior."""
+    if status_code == 403:
+        return "forbidden"
+    if status_code == 429:
+        return "rate_limited"
+    if 500 <= status_code <= 599:
+        return "server_error"
+    if 400 <= status_code <= 499:
+        return "client_error"
+    return "other"
+
+
+def detect_challenge(body: bytes | None, status_code: int | None = None) -> str | None:
+    """Detect common challenge/interstitial markers without taking action."""
+    if not body:
+        return None
+
+    text = body.decode("utf-8", errors="ignore").lower()
+
+    indicators = (
+        ("recaptcha", "recaptcha"),
+        ("captcha", "captcha"),
+        ("cloudflare", "cloudflare"),
+        ("just a moment", "cloudflare_challenge"),
+        ("checking your browser", "browser_check"),
+        ("verify you are human", "human_verification"),
+        ("access denied", "access_denied"),
+        ("security check", "security_check"),
+        ("bot detection", "bot_detection"),
+        ("enable javascript and cookies", "browser_requirement"),
+    )
+
+    for marker, challenge_type in indicators:
+        if marker in text:
+            return challenge_type
+
+    return None
+
 
 def needs_render(body: bytes) -> bool:
     """Heuristic: did the static HTML actually contain the content?"""
@@ -77,9 +116,37 @@ class HttpFetcher:
                     return FetchResult(task, FetchOutcome.NOT_MODIFIED, 304,
                                        duration_ms=elapsed())
                 if resp.status_code >= 400:
-                    return FetchResult(task, FetchOutcome.HTTP_ERROR, resp.status_code,
-                                       duration_ms=elapsed())
+                    chunks, total = [], 0
 
+                    async for chunk in resp.aiter_bytes():
+                        total += len(chunk)
+                        if total > MAX_BODY_BYTES:
+                            return FetchResult(
+                                task=task,
+                                outcome=FetchOutcome.TOO_LARGE,
+                                status_code=resp.status_code,
+                                final_url=str(resp.url),
+                                headers=dict(resp.headers),
+                                content_type=resp.headers.get("content-type", ""),
+                                duration_ms=elapsed(),
+                            )
+                        chunks.append(chunk)
+
+                    body = b"".join(chunks)
+                    challenge_type = detect_challenge(body, resp.status_code)
+
+                    return FetchResult(
+                        task=task,
+                        outcome=FetchOutcome.HTTP_ERROR,
+                        status_code=resp.status_code,
+                        final_url=str(resp.url),
+                        headers=dict(resp.headers),
+                        challenge_type=challenge_type,
+                        body=body,
+                        content_type=resp.headers.get("content-type", ""),
+                        encoding=resp.encoding,
+                        duration_ms=elapsed(),
+                    )
                 ctype = resp.headers.get("content-type", "")
                 # This filter exists to skip processing non-HTML page bodies
                 # (PDFs, images, ...) during a crawl. robots.txt is legitimately

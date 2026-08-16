@@ -175,6 +175,7 @@ CREATE TABLE crawl_attempts (
     render_mode     text,
     bytes           integer,
     error_class     text,
+    challenge_type text,
     error_detail    text,
     worker_id       text,
     PRIMARY KEY (id, started_at)

@@ -64,6 +64,33 @@ async def test_claim_then_complete_writes_document(frontier, db):
     assert row["status"] == "done"
     assert doc_row["title"] == "T"
 
+async def test_record_attempt_persists_challenge_type(frontier, db):
+    await frontier.seed(["https://challenge.example/p"])
+    tasks = await frontier.claim("w1", 20, 300)
+    task = tasks[0]
+
+    result = FetchResult(
+        task=task,
+        outcome=FetchOutcome.HTTP_ERROR,
+        status_code=403,
+        final_url=task.url,
+        body=b"challenge",
+        render_mode=RenderMode.STATIC,
+        challenge_type="cloudflare_challenge",
+    )
+
+    await frontier.record_attempt(result, "w1")
+
+    async with db.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT status_code, challenge_type "
+            "FROM crawl_attempts WHERE url_id=$1",
+            task.url_id,
+        )
+
+    assert row["status_code"] == 403
+    assert row["challenge_type"] == "cloudflare_challenge"
+
 
 async def test_complete_discovers_links_via_add(frontier, db):
     await frontier.seed(["https://x.example/p"])

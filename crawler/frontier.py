@@ -162,14 +162,14 @@ class PostgresFrontier:
             await conn.execute(
                 """INSERT INTO crawl_attempts
                        (url_id, duration_ms, status_code, render_mode, bytes,
-                        error_class, error_detail, worker_id)
-                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8)""",
+                        error_class, challenge_type, error_detail, worker_id)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)""",
                 result.task.url_id, result.duration_ms, result.status_code,
                 result.render_mode.value if result.render_mode else None,
                 len(result.body) if result.body else None,
-                result.error_class, result.error_detail, worker_id,
+                result.error_class, result.challenge_type, result.error_detail,
+                worker_id,
             )
-
     async def complete(self, result: FetchResult, doc: ExtractedDoc,
                        raw_key: str, text_key: str) -> None:
         next_crawl = "now() + interval '7 days'"
