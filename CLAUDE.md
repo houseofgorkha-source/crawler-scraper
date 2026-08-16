@@ -75,6 +75,41 @@ Two more, platform-only, fixes:
   event loop, producing a `RuntimeError: Event loop is closed` inside
   `AbstractConnection.__del__` on exit. Fixed by calling
   `await redis.aclose()` before `pool.close()`.
+- **Blob-store (aioboto3/aiohttp) cleanup on shutdown.** `_blob_store()`
+  entered the aioboto3 S3 client's async context manager
+  (`session.client(...).__aenter__()`) but discarded the context manager
+  itself, keeping only the client it returned. `cmd_crawl`/`cmd_scrape`/
+  `cmd_index` had no handle to call `__aexit__` on, so the underlying
+  aiohttp `ClientSession`/`TCPConnector` (aioboto3's transport) was never
+  closed — surfacing as `Unclosed client session` / `Unclosed connector`
+  warnings from aiohttp at process exit. Fixed by having `_blob_store()`
+  return `(store, cm)` and calling `await store_cm.__aexit__(None, None,
+  None)` on every shutdown path. Entering/exiting this client needs no
+  real network I/O, so it's covered by a CI-safe unit test
+  (`tests/unit/test_cli.py::test_blob_store_returns_a_closeable_context_manager`)
+  rather than requiring a live MinIO instance.
+
+**Real-load crawl (8 workers, ~20k-URL queue) surfaced and fixed a frontier
+deadlock, then exposed the current throughput bottleneck.** `add()` locked
+`domains`/`urls` rows in link-discovery order while `complete()` locked
+`urls` before `domains` — two different lock orders that concurrent
+transactions could acquire in opposite sequence (AB-BA), producing
+`DeadlockDetectedError` on roughly 5% of completed pages (51 deadlocks
+observed). Making lock order consistent (`add()` sorts links by host;
+`complete()` updates domains before urls) cut this to 6 deadlocks — the
+residual being a genuine Postgres first-insert race (two transactions
+discovering the same brand-new domain simultaneously), which Postgres's
+own docs call out as something applications must retry rather than avoid
+via ordering. A bounded 3-attempt retry around that case in `add()`
+brought the final verification run to 0 deadlocks. See `frontier.py` for
+the fix. Full suite (161 tests) passes. A longer 8-worker run afterward
+sustained only ~0.54 pages/sec; profiling pointed to domain concentration
+— too many claimed URLs sharing a small number of domains, so the shared
+politeness clock (`domains.next_available_at`) serializes most of the
+worker pool rather than fetch/extract work itself. This is now the
+current throughput constraint, not deadlocking or CPU-bound extraction —
+don't chase the latter two without re-measuring against a wider domain
+mix first.
 
 **Near-duplicate suppression is now exercised.** `index.py`'s
 `find_near_duplicate`/`mark_duplicates` path went untested for a long
@@ -85,7 +120,7 @@ test_near_duplicate.py` now seeds a genuine near-duplicate pair
 dissimilar pair (distance 4) isn't flagged, that a row never matches
 itself, and that unlisted (`simhash IS NULL`) rows are never candidates.
 
-An automated test suite exists (`tests/`, see "Tests" below; 145 tests as
+An automated test suite exists (`tests/`, see "Tests" below; 161 tests as
 of this writing) covering every module in `crawler/`: `normalize.py`,
 `extract.py`'s `simhash`/`hamming`/`HtmlExtractor`, `policy.py`'s robots
 parsing, `fetch.py`'s `needs_render()` heuristic, `scrape_extract.py`'s
@@ -222,6 +257,24 @@ pool's cross-process cap confirmed by directly polling `pg_locks` for the
 advisory-lock keys — held count never exceeded the configured
 `--render-pages` value across either process.
 
+**Real external-site verification (`submit-scrape` against `amazon.in`).**
+A `scrape_targets` row for `https://www.amazon.in/` was submitted under a
+generic two-field spec (`title`, `meta_description` — no site-specific
+logic) and processed by a real `scrape --workers 1` run: the crawler
+fetched and honored `https://www.amazon.in/robots.txt` (root path allowed
+for the declared `User-Agent`), followed the bare-domain→`www` redirect,
+fetched the real homepage (`HTTP 200`), and `HtmlRecordExtractor` produced
+a correct `scraped_records` row from the live page. This exercised the
+real fetch, robots, extraction, and storage path end-to-end against a
+genuine external site — using the Scraper's independent `scrape_targets`
+queue kept this fully isolated from the Crawler's much larger `urls`
+frontier (confirmed: the frontier's `amazon.in` row count was unchanged
+by the run). Not proven: rendering/JS behavior against Amazon (static
+fetch already returned usable content, so `render_mode: auto` never
+escalated), any page beyond the homepage, or sustained multi-request
+behavior — only a single, robots-compliant request was made, deliberately
+short of anything resembling bot-detection evasion.
+
 **The five operating modes are configuration, not code paths**: which of
 `crawl` / `scrape` processes are running, plus two independent opt-in
 feed rules — `crawl --feed-scraper` (Crawler → Scraper: crawled URLs
@@ -351,4 +404,8 @@ push/PR via `.github/workflows/tests.yml`.
 4. Postgres write-bound → introduce a real queue between fetch and extract.
    Only then is Kafka justified.
 
-Don't pre-optimize for a stage you haven't hit yet.
+Don't pre-optimize for a stage you haven't hit yet — and per the real-load
+finding above, the currently observed bottleneck (~0.54 pages/sec at 8
+workers) is domain concentration against the shared politeness clock, not
+any of these four stages. Widen the seeded domain mix and re-measure
+before assuming stage 2 or 3 applies.

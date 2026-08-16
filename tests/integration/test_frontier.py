@@ -7,6 +7,8 @@ isolating it keeps test runs deterministic regardless).
 The `frontier` fixture itself lives in tests/conftest.py, shared with the
 live worker integration tests.
 """
+import asyncpg
+import pytest
 import redis.asyncio as aioredis
 
 from crawler.contracts import (
@@ -224,6 +226,132 @@ async def test_refresh_robots_preserves_port_in_origin_not_in_domain_key(db):
     async with db.acquire() as conn:
         row = await conn.fetchrow("SELECT host FROM domains WHERE host = $1", "127.0.0.1")
     assert row["host"] == "127.0.0.1"  # politeness key stays port-free
+
+
+async def test_add_sorts_links_by_host_before_locking(frontier, db):
+    """The AB-BA deadlock fix relies on add() acquiring domain/url locks in
+    a deterministic order across concurrent callers. That determinism comes
+    from sorting discovered links by host before the transaction starts --
+    assert that ordering directly rather than only the end-to-end insert
+    result, so a regression that silently drops the sort (but still inserts
+    everything correctly) is still caught."""
+    await frontier.seed(["https://origin.example/p"])
+    tasks = await frontier.claim("w1", 20, 300)
+    origin = tasks[0]
+
+    links = [
+        DiscoveredLink(url="https://zzz.example/a"),
+        DiscoveredLink(url="https://aaa.example/b"),
+        DiscoveredLink(url="https://mmm.example/c"),
+    ]
+    seen_hosts = []
+    real_add_once = frontier._add_once
+
+    async def spy_add_once(sorted_links, from_url_id, depth):
+        seen_hosts.extend(l.url for l in sorted_links)
+        return await real_add_once(sorted_links, from_url_id, depth)
+
+    frontier._add_once = spy_add_once
+    try:
+        await frontier.add(links, from_url_id=origin.url_id, depth=1)
+    finally:
+        frontier._add_once = real_add_once
+
+    assert seen_hosts == [
+        "https://aaa.example/b", "https://mmm.example/c", "https://zzz.example/a",
+    ]
+
+
+async def test_add_retries_on_deadlock_then_succeeds(frontier, db):
+    """The residual first-insert race (two transactions racing to INSERT
+    the same brand-new domain) can't be prevented by lock ordering alone --
+    add() must retry a bounded number of times rather than silently
+    dropping the page's discovered links."""
+    await frontier.seed(["https://origin2.example/p"])
+    tasks = await frontier.claim("w1", 20, 300)
+    origin = tasks[0]
+
+    real_add_once = frontier._add_once
+    calls = {"n": 0}
+
+    async def flaky_add_once(links, from_url_id, depth):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise asyncpg.exceptions.DeadlockDetectedError("deadlock detected")
+        return await real_add_once(links, from_url_id, depth)
+
+    frontier._add_once = flaky_add_once
+    try:
+        n = await frontier.add(
+            [DiscoveredLink(url="https://new-domain.example/x")],
+            from_url_id=origin.url_id, depth=1,
+        )
+    finally:
+        frontier._add_once = real_add_once
+
+    assert calls["n"] == 3
+    assert n == 1
+
+
+async def test_add_gives_up_after_bounded_retries(frontier, db):
+    """Retrying forever would hide a genuinely stuck transaction; the
+    bound must actually be enforced, not just present as a loop with an
+    unreachable exit."""
+    await frontier.seed(["https://origin3.example/p"])
+    tasks = await frontier.claim("w1", 20, 300)
+    origin = tasks[0]
+
+    calls = {"n": 0}
+
+    async def always_deadlocks(links, from_url_id, depth):
+        calls["n"] += 1
+        raise asyncpg.exceptions.DeadlockDetectedError("deadlock detected")
+
+    frontier._add_once = always_deadlocks
+    with pytest.raises(asyncpg.exceptions.DeadlockDetectedError):
+        await frontier.add(
+            [DiscoveredLink(url="https://still-new.example/x")],
+            from_url_id=origin.url_id, depth=1,
+        )
+
+    assert calls["n"] == 3
+
+
+async def test_complete_updates_domain_before_url(frontier, db):
+    """complete()'s lock order (domain row, then url row) must match
+    add()'s to avoid the AB-BA cycle between the two functions. The two
+    statements run back-to-back inside one transaction on one connection,
+    so there's no externally observable side effect to assert on (no
+    intermediate commit, no separate connection to race) -- the ordering
+    itself only exists in source order. Assert against that directly: a
+    regression that silently swaps the two UPDATEs back to urls-then-domains
+    would reintroduce the AB-BA cycle with add() without changing any
+    row's final value, so a result-only test can't catch it."""
+    import inspect
+
+    from crawler import frontier as frontier_module
+
+    source = inspect.getsource(frontier_module.PostgresFrontier.complete)
+    domains_pos = source.index("UPDATE domains SET pages_crawled")
+    urls_pos = source.index("UPDATE urls SET")
+    assert domains_pos < urls_pos, (
+        "complete() must update domains before urls to match add()'s lock "
+        "order -- see the comment above these statements in frontier.py"
+    )
+
+    # Also confirm the statements still do what they claim, so this test
+    # fails if either UPDATE is ever removed rather than just reordered.
+    await frontier.seed(["https://order.example/p"])
+    tasks = await frontier.claim("w1", 20, 300)
+    task = tasks[0]
+    await frontier.complete(_result(task), _doc(task.url_id), raw_key="raw/k", text_key="text/k")
+    async with db.acquire() as conn:
+        url_row = await conn.fetchrow("SELECT status FROM urls WHERE id=$1", task.url_id)
+        domain_row = await conn.fetchrow(
+            "SELECT pages_crawled FROM domains WHERE host=$1", task.host
+        )
+    assert url_row["status"] == "done"
+    assert domain_row["pages_crawled"] == 1
 
 
 async def test_refresh_robots_without_url_omits_origin(db):

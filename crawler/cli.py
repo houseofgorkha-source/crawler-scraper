@@ -85,18 +85,23 @@ async def _pool() -> asyncpg.Pool:
     return await asyncpg.create_pool(PG_DSN, min_size=4, max_size=32)
 
 
-async def _blob_store() -> BlobStore:
+async def _blob_store() -> tuple[BlobStore, object]:
     import aioboto3
     session = aioboto3.Session()
     # aioboto3 clients are async context managers; for a long-lived daemon we
-    # enter once and hold it for the process lifetime.
+    # enter once and hold it for the process lifetime. The context manager
+    # itself (not just the client it yields) has to be kept and __aexit__'d
+    # on shutdown -- it owns the underlying aiohttp ClientSession/connector,
+    # and without a matching exit that session is never closed, leaking a
+    # connection until the process exits ("Unclosed client session" /
+    # "Unclosed connector" warnings from aiohttp at GC time).
     cm = session.client(
         "s3", endpoint_url=os.environ.get("CRAWLER_S3_ENDPOINT", "http://localhost:9000"),
         aws_access_key_id=os.environ.get("CRAWLER_S3_KEY", "minioadmin"),
         aws_secret_access_key=os.environ.get("CRAWLER_S3_SECRET", "minioadmin"),
     )
     client = await cm.__aenter__()
-    return BlobStore(client, S3_BUCKET)
+    return BlobStore(client, S3_BUCKET), cm
 
 
 def _maybe_start_metrics(port: int | None) -> None:
@@ -138,7 +143,7 @@ async def cmd_crawl(args: argparse.Namespace) -> None:
     pool = await _pool()
     redis = aioredis.from_url(REDIS_URL)
     frontier = PostgresFrontier(pool, redis, robots_fetcher=_fetch_robots)
-    store = await _blob_store()
+    store, store_cm = await _blob_store()
 
     renderer = None
     if not args.no_render:
@@ -176,6 +181,7 @@ async def cmd_crawl(args: argparse.Namespace) -> None:
     await asyncio.gather(*tasks, return_exceptions=True)
     if renderer:
         await renderer.aclose()
+    await store_cm.__aexit__(None, None, None)
     await redis.aclose()
     await pool.close()
 
@@ -185,7 +191,7 @@ async def cmd_scrape(args: argparse.Namespace) -> None:
     pool = await _pool()
     redis = aioredis.from_url(REDIS_URL)
     frontier = PostgresFrontier(pool, redis, robots_fetcher=_fetch_robots)
-    store = await _blob_store()
+    store, store_cm = await _blob_store()
 
     renderer = None
     if not args.no_render:
@@ -222,6 +228,7 @@ async def cmd_scrape(args: argparse.Namespace) -> None:
     await asyncio.gather(*tasks, return_exceptions=True)
     if renderer:
         await renderer.aclose()
+    await store_cm.__aexit__(None, None, None)
     await redis.aclose()
     await pool.close()
 
@@ -344,7 +351,7 @@ async def cmd_index(args: argparse.Namespace) -> None:
     _maybe_start_metrics(args.metrics_port)
     pool = await _pool()
     db = IndexerDB(pool)
-    store = await _blob_store()
+    store, store_cm = await _blob_store()
 
     async with AsyncClient(MEILI_URL, MEILI_KEY) as search:
         index = await search.create_index("pages", primary_key="id")
@@ -359,7 +366,9 @@ async def cmd_index(args: argparse.Namespace) -> None:
         await stop.wait()
         indexer.stop()
         task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
+    await store_cm.__aexit__(None, None, None)
     await pool.close()
 
 

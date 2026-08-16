@@ -147,8 +147,14 @@ and which flags are set, not different code.
 locks — see "Rendering is escalation, not default" above.
 
 Verified against live infra: nested/repeated structured extraction from a
-listing page, and the Scraper → Crawler link-feed mechanism handing a
-discovered link to the Crawler's own frontier.
+listing page, the Scraper → Crawler link-feed mechanism handing a
+discovered link to the Crawler's own frontier, and a real external-site
+run (`submit-scrape` against `https://www.amazon.in/` under a generic
+title/meta-description spec) — real robots.txt fetch and redirect
+handling, a real 200 response, and a correct `scraped_records` row,
+fully isolated from the Crawler's `urls` frontier via the Scraper's own
+`scrape_targets` queue. See `CLAUDE.md` for exactly what was and wasn't
+proven by that run.
 
 ## Layout
 
@@ -186,13 +192,45 @@ python -m crawler.cli scrape --workers 8
 
 ## Scale-out path
 
-1. **Now** — one box, 8 async workers, ~50–100 pages/sec on static content.
+1. **Now** — one box, 8 async workers, ~50–100 pages/sec on static content
+   *under a diverse domain mix*. Against a domain-concentrated backlog this
+   does not hold — see "Real-load findings" below.
 2. **Bottleneck: extraction CPU** — move extraction to its own process pool.
    Contract already separates it.
 3. **Bottleneck: fetch concurrency** — replace `HttpFetcher` with Go workers
    reading the same `claim_urls()`. Nothing downstream changes.
 4. **Bottleneck: Postgres write throughput** — introduce a real queue between
    fetch and extract. Only then is Kafka justified.
+
+Don't jump to 2–4 without re-measuring — the one real-load run performed so
+far points at neither CPU, fetch concurrency, nor Postgres writes.
+
+## Real-load findings
+
+An 8-worker run against a real, domain-concentrated backlog (the largest
+single domains held thousands of pending URLs each — `linkedin.com`,
+`iana.org`, `datatracker.ietf.org`, `icann.org` among them) surfaced two
+things a synthetic/diverse-domain test wouldn't have:
+
+- **A concurrency bug**, now fixed — see "eliminate deadlocks in concurrent
+  add()/complete()" in `CLAUDE.md`. Lock-order inconsistency between `add()`
+  and `complete()` caused `DeadlockDetectedError` on ~5% of completions (51
+  observed); consistent lock ordering cut that to 6, and a bounded 3-attempt
+  retry closed the residual Postgres first-insert race, reaching 0
+  deadlocks. Regression-tested in `tests/integration/test_frontier.py`.
+- **The actual throughput constraint is domain concentration, not CPU,
+  fetch concurrency, or Postgres writes.** A longer 8-worker run sustained
+  only ~0.54 pages/sec. A follow-up 150-second run against the same kind of
+  backlog reproduced this directly: near-zero completions for the first
+  ~60-80 seconds (robots.txt resolution, redirect chains, and occasional
+  403 blocks on the handful of large concentrated domains dominating early
+  claims), then acceleration to several pages/sec once workers reached
+  smaller, faster domains — netting ~100 pages in 150s (~0.67 pages/sec
+  average, back-loaded). The shared politeness clock
+  (`domains.next_available_at`) is doing what it's designed to do; the
+  problem is that a backlog dominated by a few huge domains gives workers
+  little else to do while waiting on it. Widening the seeded domain mix,
+  not any of the four scale-out stages above, is the next thing to try.
 
 ## Verified
 
