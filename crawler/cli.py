@@ -56,8 +56,13 @@ async def _fetch_robots(host: str, origin: str | None = None) -> tuple[str | Non
         from .contracts import CrawlTask, FetchOutcome
 
         async def _get(scheme_authority: str):
+            # robots.txt is legitimately served as text/plain (the de-facto
+            # standard, confirmed live against real sites), not text/html --
+            # expect_html=False keeps the body regardless of declared
+            # content-type, instead of silently discarding it.
             return await fetcher.fetch(CrawlTask(
-                url_id=-1, url=f"{scheme_authority}/robots.txt", host=host, depth=0))
+                url_id=-1, url=f"{scheme_authority}/robots.txt", host=host, depth=0),
+                expect_html=False)
 
         if origin is not None:
             # The caller (frontier.refresh_robots) resolved this from the
@@ -345,6 +350,33 @@ async def cmd_records_list(args: argparse.Namespace) -> None:
     await pool.close()
 
 
+async def _create_index_with_retry(search, stop: asyncio.Event, delay: float = 5.0):
+    # "Indexing is asynchronous ... the crawl must never block on
+    # Meilisearch being slow or down" (CLAUDE.md) applies to the indexer
+    # process's own startup too, not just to the crawl itself: Meilisearch
+    # simply not being up yet (a normal docker-compose startup race, or a
+    # transient outage) previously crashed cmd_index immediately via an
+    # unguarded create_index()/update_settings() call, before Indexer.run()
+    # -- whose own per-batch loop already tolerates Meilisearch failures --
+    # ever got a chance to start. Retry with a fixed backoff until
+    # Meilisearch answers or shutdown is requested, instead of requiring an
+    # external supervisor to keep restarting a process that crash-loops.
+    from meilisearch_python_sdk.errors import MeilisearchCommunicationError
+
+    while not stop.is_set():
+        try:
+            index = await search.create_index("pages", primary_key="id")
+            await index.update_settings(SETTINGS)
+            return index
+        except MeilisearchCommunicationError:
+            log.warning("meilisearch_unavailable_at_startup", retry_in_s=delay)
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=delay)
+            except asyncio.TimeoutError:
+                pass
+    return None
+
+
 async def cmd_index(args: argparse.Namespace) -> None:
     from meilisearch_python_sdk import AsyncClient
 
@@ -353,20 +385,19 @@ async def cmd_index(args: argparse.Namespace) -> None:
     db = IndexerDB(pool)
     store, store_cm = await _blob_store()
 
+    stop = asyncio.Event()
+    _install_stop_handler(stop)
+
     async with AsyncClient(MEILI_URL, MEILI_KEY) as search:
-        index = await search.create_index("pages", primary_key="id")
-        await index.update_settings(SETTINGS)
-        indexer = Indexer(db, search, store)
-
-        stop = asyncio.Event()
-        _install_stop_handler(stop)
-
-        task = asyncio.create_task(indexer.run())
-        log.info("indexer_started")
-        await stop.wait()
-        indexer.stop()
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        index = await _create_index_with_retry(search, stop)
+        if index is not None:
+            indexer = Indexer(db, search, store)
+            task = asyncio.create_task(indexer.run())
+            log.info("indexer_started")
+            await stop.wait()
+            indexer.stop()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     await store_cm.__aexit__(None, None, None)
     await pool.close()

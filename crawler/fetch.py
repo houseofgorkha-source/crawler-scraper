@@ -57,7 +57,7 @@ class HttpFetcher:
             http2=True,
         )
 
-    async def fetch(self, task: CrawlTask | ScrapeTask) -> FetchResult:
+    async def fetch(self, task: CrawlTask | ScrapeTask, *, expect_html: bool = True) -> FetchResult:
         started = time.perf_counter()
 
         # Conditional request: a 304 costs almost nothing and is the cheapest
@@ -81,7 +81,13 @@ class HttpFetcher:
                                        duration_ms=elapsed())
 
                 ctype = resp.headers.get("content-type", "")
-                if not any(t in ctype for t in _HTML_TYPES):
+                # This filter exists to skip processing non-HTML page bodies
+                # (PDFs, images, ...) during a crawl. robots.txt is legitimately
+                # served as text/plain (the de-facto standard content-type --
+                # confirmed live against Amazon, Wikipedia, IANA) and must never
+                # be dropped by it, so callers fetching robots.txt pass
+                # expect_html=False to always keep the body.
+                if expect_html and not any(t in ctype for t in _HTML_TYPES):
                     return FetchResult(task, FetchOutcome.NON_HTML, resp.status_code,
                                        content_type=ctype, duration_ms=elapsed())
 
