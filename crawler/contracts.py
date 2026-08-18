@@ -11,7 +11,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Protocol, Sequence
+from typing import TYPE_CHECKING, Protocol, Sequence
+
+if TYPE_CHECKING:
+    from .scrape_extract import ScrapeSpec
 
 
 class RenderMode(str, Enum):
@@ -29,6 +32,25 @@ class FetchOutcome(str, Enum):
     TOO_LARGE = "too_large"
     STORAGE_ERROR = "storage_error"   # blob store write failed after a successful fetch
 
+class ChallengeResolution(str, Enum):
+    RESOLVED = "resolved"
+    UNRESOLVED = "unresolved"
+
+
+@dataclass(slots=True)
+class Challenge:
+    challenge_type: str
+    status_code: int | None
+    url: str
+    headers: dict[str, str] = field(default_factory=dict)
+    body: bytes | None = None
+
+
+@dataclass(slots=True)
+class ChallengeResolutionResult:
+    outcome: ChallengeResolution
+    fetch_result: FetchResult | None = None
+    error_detail: str | None = None
 
 # --------------------------------------------------------------------------
 # Stage 1 -> 2 : Frontier hands work to a fetch worker
@@ -50,7 +72,7 @@ class CrawlTask:
 # --------------------------------------------------------------------------
 @dataclass(slots=True)
 class FetchResult:
-    task: CrawlTask | "ScrapeTask"
+    task: "CrawlTask | ScrapeTask"
     outcome: FetchOutcome
     status_code: int | None = None
     final_url: str | None = None            # after redirects; may differ from task.url
@@ -137,6 +159,13 @@ class Frontier(Protocol):
 
 class Fetcher(Protocol):
     async def fetch(self, task: CrawlTask | ScrapeTask) -> FetchResult: ...
+
+
+class ChallengeResolver(Protocol):
+    async def resolve(
+        self, challenge: Challenge,
+        task: CrawlTask | ScrapeTask,
+    ) -> ChallengeResolutionResult: ...
 
 
 class Renderer(Protocol):

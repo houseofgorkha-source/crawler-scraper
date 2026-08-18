@@ -14,6 +14,7 @@ import os
 import threading
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from http import HTTPStatus
 
 import asyncpg
 import pytest
@@ -67,13 +68,93 @@ async def frontier(db):
     await redis.aclose()
 
 
+@pytest_asyncio.fixture
+async def renderer():
+    from crawler.render import PlaywrightRenderer
+
+    renderer = PlaywrightRenderer(TEST_PG_DSN)
+    await renderer.start()
+    try:
+        yield renderer
+    finally:
+        await renderer.aclose()
+
+
+
+class LabFixtureHandler(SimpleHTTPRequestHandler):
+    """Static fixture server plus deterministic HTTP obstacle responses."""
+
+    def do_GET(self):
+        routes = {
+            "/lab/403": (
+                HTTPStatus.FORBIDDEN,
+                b"<html><body><h1>Access Denied</h1><p>WAF lab fixture</p></body></html>",
+                {"Content-Type": "text/html"},
+            ),
+            "/lab/429": (
+                HTTPStatus.TOO_MANY_REQUESTS,
+                b"<html><body><h1>Rate Limited</h1></body></html>",
+                {"Content-Type": "text/html", "Retry-After": "1"},
+            ),
+            "/lab/js-challenge": (
+                HTTPStatus.OK,
+                b"""<html><body>
+                    <h1>Just a moment...</h1>
+                    <p>Checking your browser before accessing this site.</p>
+                    <script>
+                        setTimeout(() => {
+                            document.body.innerHTML =
+                                '<h1>JS Challenge Resolved</h1>' +
+                                '<p>Authorized browser access granted.</p>';
+                        }, 100);
+                    </script>
+                </body></html>""",
+                {"Content-Type": "text/html"},
+            ),
+           "/lab/captcha": (
+                HTTPStatus.OK,
+                b"""<html><body>
+                    <h1 id="challenge">Human verification</h1>
+                    <div class="g-recaptcha">CAPTCHA</div>
+                    <p>Please verify you are human.</p>
+                    <script>
+                        setTimeout(() => {
+                            document.body.innerHTML =
+                                '<h1>CAPTCHA Resolved</h1>' +
+                                '<p>Authorized browser access granted.</p>';
+                        }, 50);
+                    </script>
+                </body></html>""",
+                {"Content-Type": "text/html"},
+            ),
+            "/lab/auth": (
+                HTTPStatus.UNAUTHORIZED,
+                b"""<html><body>
+                    <h1>Authentication Required</h1>
+                    <p>Please sign in to continue.</p>
+                </body></html>""",
+                {"Content-Type": "text/html", "WWW-Authenticate": 'Basic realm="lab"'},
+            ),
+        }
+
+        route = routes.get(self.path)
+        if route is None:
+            return super().do_GET()
+
+        status, body, headers = route
+
+        self.send_response(status)
+        for name, value in headers.items():
+            self.send_header(name, value)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
 @pytest.fixture
 def fixture_server():
-    """In-process static file server for tests/fixtures/, bound to an
-    OS-assigned free port -- no manual start/stop, no port collisions,
-    replacing the manual scratchpad http.server dance used throughout
-    this project's earlier live verification."""
-    handler = functools.partial(SimpleHTTPRequestHandler, directory=str(FIXTURES_DIR))
+    """In-process static file server plus deterministic lab obstacle routes."""
+    handler = functools.partial(LabFixtureHandler, directory=str(FIXTURES_DIR))
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()

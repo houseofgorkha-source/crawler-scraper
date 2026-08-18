@@ -19,7 +19,7 @@ import dataclasses
 import logging
 import uuid
 
-from .contracts import FetchOutcome, FetchResult
+from .contracts import Challenge, ChallengeResolution, FetchOutcome, FetchResult
 from .fetch import HttpFetcher, needs_render
 from .metrics import FETCH_DURATION_SECONDS, SCRAPE_TASKS
 from .scrape_extract import HtmlRecordExtractor, ScrapeSpec
@@ -34,11 +34,13 @@ MAX_FAILURES = 5
 
 class ScrapeWorker:
     def __init__(self, frontier, store, fetcher=None, renderer=None,
-                 extractor=None, worker_id: str | None = None):
+                 extractor=None, worker_id: str | None = None,
+                 challenge_resolver=None):
         self.frontier = frontier
         self.store = store
         self.fetcher = fetcher or HttpFetcher()
         self.renderer = renderer
+        self.challenge_resolver = challenge_resolver
         self.extractor = extractor or HtmlRecordExtractor()
         self.worker_id = worker_id or f"scraper-{uuid.uuid4().hex[:8]}"
         self._running = False
@@ -64,12 +66,6 @@ class ScrapeWorker:
 
     async def _handle(self, task) -> None:
         policy = await self.frontier.policy_for(task.host, task.url)
-        if policy.is_stale:
-            policy = await self.frontier.refresh_robots(task.host, task.url)
-        if not policy.check_allowed(task.url):
-            await self.frontier.skip_scrape(task, reason="robots_denied")
-            SCRAPE_TASKS.labels(outcome="robots_denied").inc()
-            return
 
         spec = await self.frontier.get_scrape_spec(task.spec_id)
         if spec is None:
@@ -97,6 +93,25 @@ class ScrapeWorker:
         FETCH_DURATION_SECONDS.labels(
             subsystem="scraper", render_mode=result.render_mode.value
         ).observe(result.duration_ms / 1000)
+
+        if result.challenge_type and self.challenge_resolver is not None:
+            challenge = Challenge(
+                challenge_type=result.challenge_type,
+                status_code=result.status_code,
+                url=result.final_url or task.url,
+                headers=result.headers,
+                body=result.body,
+            )
+            resolution = await self.challenge_resolver.resolve(challenge, task)
+            if resolution.outcome is ChallengeResolution.RESOLVED:
+                if resolution.fetch_result is not None:
+                    result = resolution.fetch_result
+            else:
+                await self.frontier.fail_scrape(
+                    task, result, max_failures=MAX_FAILURES
+                )
+                SCRAPE_TASKS.labels(outcome=result.outcome.value).inc()
+                return
 
         if result.outcome is FetchOutcome.NOT_MODIFIED:
             await self.frontier.reschedule_scrape(task)
@@ -142,6 +157,8 @@ class ScrapeWorker:
         # ever reached, so reaching here with render_mode == "always"
         # guarantees self.renderer is not None.
         if spec.render_mode == "always":
+            if self.renderer is None:
+                raise RuntimeError("render_mode='always' requires a renderer")
             return await self.renderer.render(task)
         if spec.render_mode == "never" or self.renderer is None:
             return await self.fetcher.fetch(task)
@@ -152,7 +169,8 @@ class ScrapeWorker:
         # static when no renderer is configured is correct here, not a
         # silent downgrade.
         result = await self.fetcher.fetch(task)
-        if result.has_body and needs_render(result.body):
+        body = result.body
+        if body is not None and self.renderer is not None and needs_render(body):
             rendered = await self.renderer.render(task)
             if rendered.has_body:
                 return rendered

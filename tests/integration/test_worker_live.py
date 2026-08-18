@@ -8,9 +8,10 @@ dev database.
 """
 import asyncio
 
+from crawler.challenge import RendererChallengeResolver
+from crawler.contracts import FetchOutcome, FetchResult, RenderMode
 from crawler.store import BlobStore
 from crawler.worker import CrawlWorker
-
 
 class _FakeBody:
     def __init__(self, data: bytes):
@@ -134,3 +135,144 @@ async def test_feed_scraper_enrolls_via_real_enroll_scrape_targets(db, frontier,
         )
     assert target is not None
     assert target["status"] == "pending"
+
+
+async def test_403_fixture_is_classified_and_fails_normally(
+    db, frontier, fixture_server
+):
+    url = f"{fixture_server}/lab/403"
+    await frontier.seed([url])
+
+    worker = CrawlWorker(frontier, _store(), renderer=None, worker_id="live-w0")
+
+    await _run_one_batch(worker)
+
+    async with db.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT status, last_status_code, consecutive_failures
+            FROM urls
+            WHERE url = $1
+            """,
+            url,
+        )
+
+    assert row["last_status_code"] == 403
+    assert row["consecutive_failures"] == 1
+    assert row["status"] == "pending"
+
+
+async def test_429_fixture_preserves_rate_limit_response_and_backoff(
+    db, frontier, fixture_server
+):
+    url = f"{fixture_server}/lab/429"
+    await frontier.seed([url])
+
+    worker = CrawlWorker(frontier, _store(), renderer=None, worker_id="live-w0")
+
+    await _run_one_batch(worker)
+
+    async with db.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT status,
+                   last_status_code,
+                   consecutive_failures,
+                   next_crawl_at > now() AS backed_off
+            FROM urls
+            WHERE url = $1
+            """,
+            url,
+        )
+
+    assert row["last_status_code"] == 429
+    assert row["consecutive_failures"] == 1
+    assert row["status"] == "pending"
+    assert row["backed_off"] is True
+
+
+async def test_js_challenge_fixture_is_resolved_by_renderer(
+    db, frontier, fixture_server, renderer
+):
+    url = f"{fixture_server}/lab/js-challenge"
+    await frontier.seed([url])
+
+    worker = CrawlWorker(
+        frontier,
+        _store(),
+        renderer=renderer,
+        challenge_resolver=RendererChallengeResolver(renderer),
+        worker_id="live-w0",
+    )
+
+    await _run_one_batch(worker)
+
+    async with db.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT status, last_status_code, consecutive_failures
+            FROM urls
+            WHERE url = $1
+            """,
+            url,
+        )
+
+    assert row["last_status_code"] == 200
+    assert row["consecutive_failures"] == 0
+    assert row["status"] == "done"
+
+
+async def test_captcha_fixture_is_detected_and_follows_normal_failure_path(
+    db, frontier, fixture_server, renderer
+):
+    url = f"{fixture_server}/lab/captcha"
+    await frontier.seed([url])
+
+    worker = CrawlWorker(
+        frontier,
+        _store(),
+        renderer=renderer,
+        challenge_resolver=RendererChallengeResolver(renderer),
+        worker_id="live-w0",
+    )
+
+    await _run_one_batch(worker)
+
+    async with db.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT status, last_status_code, consecutive_failures
+            FROM urls
+            WHERE url = $1
+            """,
+            url,
+        )
+
+    assert row["last_status_code"] == 200
+    assert row["consecutive_failures"] == 0
+    assert row["status"] == "done"
+
+
+async def test_authentication_fixture_fails_normally(
+    db, frontier, fixture_server
+):
+    url = f"{fixture_server}/lab/auth"
+    await frontier.seed([url])
+
+    worker = CrawlWorker(frontier, _store(), renderer=None, worker_id="live-w0")
+
+    await _run_one_batch(worker)
+
+    async with db.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT status, last_status_code, consecutive_failures
+            FROM urls
+            WHERE url = $1
+            """,
+            url,
+        )
+
+    assert row["last_status_code"] == 401
+    assert row["consecutive_failures"] == 1
+    assert row["status"] == "pending"

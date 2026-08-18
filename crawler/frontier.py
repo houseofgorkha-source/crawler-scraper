@@ -158,6 +158,7 @@ class PostgresFrontier:
     # Outcomes
     # ------------------------------------------------------------------ #
     async def record_attempt(self, result: FetchResult, worker_id: str) -> None:
+        assert isinstance(result.task, CrawlTask)
         async with self.pool.acquire() as conn:
             await conn.execute(
                 """INSERT INTO crawl_attempts
@@ -170,8 +171,10 @@ class PostgresFrontier:
                 result.error_class, result.challenge_type, result.error_detail,
                 worker_id,
             )
+
     async def complete(self, result: FetchResult, doc: ExtractedDoc,
                        raw_key: str, text_key: str) -> None:
+        assert isinstance(result.task, CrawlTask)
         next_crawl = "now() + interval '7 days'"
         # simhash() returns an unsigned 64-bit value; Postgres bigint is
         # signed int64, so values >= 2**63 overflow on bind. Store the
@@ -236,6 +239,7 @@ class PostgresFrontier:
         log.info("skipped url_id=%s reason=%s", task.url_id, reason)
 
     async def fail(self, result: FetchResult, max_failures: int = MAX_FAILURES_DEFAULT) -> None:
+        assert isinstance(result.task, CrawlTask)
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
                 """UPDATE urls SET
@@ -592,7 +596,7 @@ class PostgresFrontier:
         return dict(row) if row else None
 
     async def set_spec_active(self, name: str, active: bool,
-                              version: int | None = None) -> int:
+                              version: int | None = None) -> int | None:
         """Returns the spec id updated, or None if no matching spec exists."""
         row = await self.get_spec_row(name, version)
         if row is None:

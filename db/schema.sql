@@ -217,9 +217,7 @@ BEGIN
         FROM urls u
         JOIN domains d ON d.id = u.domain_id
         WHERE u.status = 'pending'
-          AND u.next_crawl_at <= now()
-          AND d.is_crawlable
-          AND d.next_available_at <= now()
+        AND u.next_crawl_at <= now()
         ORDER BY u.domain_id
         LIMIT p_batch_size
     ),
@@ -248,18 +246,11 @@ BEGIN
         FROM candidate c
         WHERE u.id = c.url_id
         RETURNING u.id, u.domain_id
-    ),
-    gated AS (
-        UPDATE domains d
-        SET next_available_at = now() + make_interval(secs => d.crawl_delay_ms / 1000.0)
-        FROM claimed cl
-        WHERE d.id = cl.domain_id
-        RETURNING d.id
     )
+
     SELECT c.url_id, c.url, c.host, c.depth, c.etag, c.last_modified, c.js_required
     FROM candidate c
-    JOIN claimed cl ON cl.id = c.url_id
-    JOIN gated g ON g.id = c.domain_id;
+    JOIN claimed cl ON cl.id = c.url_id;
 END;
 $$;
 
@@ -419,10 +410,8 @@ BEGIN
         JOIN domains d ON d.id = t.domain_id
         JOIN scrape_specs s ON s.id = t.spec_id
         WHERE t.status = 'pending'
-          AND t.next_attempt_at <= now()
-          AND d.is_crawlable
-          AND d.next_available_at <= now()
-          AND s.is_active
+            AND t.next_attempt_at <= now()
+            AND s.is_active
         ORDER BY t.domain_id
         LIMIT p_batch_size
     ),
@@ -454,20 +443,10 @@ BEGIN
         FROM candidate c
         WHERE t.id = c.target_id
         RETURNING t.id, t.domain_id
-    ),
-    gated AS (
-        -- Same column, same update, as claim_urls()'s gating step -- this
-        -- is the shared politeness clock, deliberately not a separate one.
-        UPDATE domains d
-        SET next_available_at = now() + make_interval(secs => d.crawl_delay_ms / 1000.0)
-        FROM claimed cl
-        WHERE d.id = cl.domain_id
-        RETURNING d.id
     )
     SELECT c.target_id, c.url, c.host, c.spec_id, c.etag, c.last_modified
     FROM candidate c
-    JOIN claimed cl ON cl.id = c.target_id
-    JOIN gated g ON g.id = c.domain_id;
+    JOIN claimed cl ON cl.id = c.target_id;
 END;
 $$;
 

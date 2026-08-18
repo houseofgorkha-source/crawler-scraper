@@ -6,8 +6,16 @@ verifying control flow without live infra.
 from unittest.mock import AsyncMock, MagicMock
 
 from crawler.contracts import (
-    DiscoveredLink, FetchOutcome, FetchResult, RenderMode, ScrapedRecord, ScrapeTask,
+    ChallengeResolution,
+    ChallengeResolutionResult,
+    DiscoveredLink,
+    FetchOutcome,
+    FetchResult,
+    RenderMode,
+    ScrapedRecord,
+    ScrapeTask,
 )
+
 from crawler.policy import parse_robots
 from crawler.scrape_extract import ScrapeSpec
 from crawler.scrape_worker import ScrapeWorker
@@ -36,7 +44,7 @@ def _record(links=()):
     return ScrapedRecord(target_id=1, spec_id=1, data={"x": "y"}, links=list(links))
 
 
-def _worker(renderer=None):
+def _worker(renderer=None, challenge_resolver=None):
     frontier = AsyncMock()
     frontier.policy_for.return_value = ALLOW_ALL
     frontier.get_scrape_spec.return_value = _spec()
@@ -46,19 +54,25 @@ def _worker(renderer=None):
     extractor.extract.return_value = _record()
     store = AsyncMock()
     store.put_raw.return_value = "raw/k"
-    worker = ScrapeWorker(frontier, store, fetcher=fetcher, renderer=renderer,
-                          extractor=extractor, worker_id="s0")
+    worker = ScrapeWorker(
+        frontier,
+        store,
+        fetcher=fetcher,
+        renderer=renderer,
+        extractor=extractor,
+        worker_id="s0",
+        challenge_resolver=challenge_resolver,
+)
     return worker, frontier, fetcher, extractor, store
 
 
-async def test_robots_denied_skips_before_any_fetch():
+async def test_robots_denied_policy_does_not_block_fetch():
     worker, frontier, fetcher, extractor, store = _worker()
     frontier.policy_for.return_value = DENY_ALL
 
     await worker._handle(_task())
 
-    frontier.skip_scrape.assert_awaited_once_with(_task(), reason="robots_denied")
-    fetcher.fetch.assert_not_awaited()
+    fetcher.fetch.assert_awaited_once()
 
 
 async def test_missing_spec_skips():
@@ -211,3 +225,44 @@ async def test_feed_to_crawler_on_but_no_links_does_not_feed():
     await worker._handle(_task())
 
     frontier.feed_links_to_crawler.assert_not_awaited()
+
+
+async def test_challenge_resolver_recovers_clean_page():
+    challenge_resolver = AsyncMock()
+
+    recovered = FetchResult(
+        task=_task(),
+        outcome=FetchOutcome.OK,
+        status_code=200,
+        final_url="https://example.com/list",
+        headers={"content-type": "text/html"},
+        body=b"<html><body>recovered content</body></html>",
+        render_mode=RenderMode.RENDERED,
+        duration_ms=20,
+    )
+
+    challenge_resolver.resolve.return_value = ChallengeResolutionResult(
+        outcome=ChallengeResolution.RESOLVED,
+        fetch_result=recovered,
+    )
+
+    worker, frontier, fetcher, extractor, store = _worker(
+        challenge_resolver=challenge_resolver
+    )
+
+    fetcher.fetch.return_value = FetchResult(
+        task=_task(),
+        outcome=FetchOutcome.HTTP_ERROR,
+        status_code=403,
+        final_url="https://example.com/list",
+        headers={"content-type": "text/html"},
+        challenge_type="cloudflare_challenge",
+        body=b"<html>Just a moment...</html>",
+        render_mode=RenderMode.STATIC,
+    )
+
+    await worker._handle(_task())
+
+    challenge_resolver.resolve.assert_awaited_once()
+    extractor.extract.assert_called_once_with(recovered, _spec())
+    frontier.complete_scrape.assert_awaited_once()

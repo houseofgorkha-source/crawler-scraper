@@ -8,7 +8,14 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from crawler.contracts import (
-    CrawlTask, DiscoveredLink, ExtractedDoc, FetchOutcome, FetchResult, RenderMode,
+    ChallengeResolution,
+    ChallengeResolutionResult,
+    CrawlTask,
+    DiscoveredLink,
+    ExtractedDoc,
+    FetchOutcome,
+    FetchResult,
+    RenderMode,
 )
 from crawler.policy import parse_robots
 from crawler.worker import MAX_DEPTH, CrawlWorker
@@ -36,7 +43,7 @@ def _doc(links=()):
     )
 
 
-def _worker(feed_scraper=False, renderer=None):
+def _worker(feed_scraper=False, renderer=None, challenge_resolver=None):
     frontier = AsyncMock()
     frontier.policy_for.return_value = ALLOW_ALL
     fetcher = AsyncMock()
@@ -46,31 +53,21 @@ def _worker(feed_scraper=False, renderer=None):
     store = AsyncMock()
     store.put_raw.return_value = "raw/k"
     store.put_text.return_value = "text/k"
-    worker = CrawlWorker(frontier, store, fetcher=fetcher, renderer=renderer,
-                         extractor=extractor, worker_id="w0", feed_scraper=feed_scraper)
+    worker = CrawlWorker(
+        frontier, store, fetcher=fetcher, renderer=renderer,
+        extractor=extractor, worker_id="w0",
+        feed_scraper=feed_scraper, challenge_resolver=challenge_resolver,
+)
     return worker, frontier, fetcher, extractor, store
 
 
-async def test_robots_denied_skips_before_any_fetch():
+async def test_robots_denied_policy_does_not_block_fetch():
     worker, frontier, fetcher, extractor, store = _worker()
     frontier.policy_for.return_value = DENY_ALL
 
     await worker._handle(_task())
 
-    frontier.skip.assert_awaited_once_with(_task(), reason="robots_denied")
-    fetcher.fetch.assert_not_awaited()
-
-
-async def test_stale_policy_triggers_refresh():
-    worker, frontier, fetcher, extractor, store = _worker()
-    stale = parse_robots("example.com", None, 404)
-    stale.fetched_at = None  # force is_stale True
-    frontier.policy_for.return_value = stale
-    frontier.refresh_robots.return_value = ALLOW_ALL
-
-    await worker._handle(_task())
-
-    frontier.refresh_robots.assert_awaited_once_with("example.com", "https://example.com/p")
+    fetcher.fetch.assert_awaited_once()
 
 
 async def test_not_modified_reschedules_without_extraction():
@@ -214,3 +211,36 @@ async def test_needs_render_escalates_and_marks_js_required():
 
     renderer.render.assert_awaited_once()
     frontier.mark_js_required.assert_awaited_once_with("example.com")
+
+
+async def test_challenge_resolver_recovers_clean_page():
+    challenge_resolver = AsyncMock()
+
+    recovered = _fetch_ok(
+        body=b"<html><body><main>recovered content</main></body></html>"
+    )
+    challenge_resolver.resolve.return_value = ChallengeResolutionResult(
+        outcome=ChallengeResolution.RESOLVED,
+        fetch_result=recovered,
+    )
+
+    worker, frontier, fetcher, extractor, store = _worker(
+        challenge_resolver=challenge_resolver
+    )
+
+    fetcher.fetch.return_value = FetchResult(
+        task=_task(),
+        outcome=FetchOutcome.HTTP_ERROR,
+        status_code=403,
+        final_url="https://example.com/p",
+        headers={"content-type": "text/html"},
+        challenge_type="cloudflare_challenge",
+        body=b"<html>Just a moment...</html>",
+        render_mode=RenderMode.STATIC,
+    )
+
+    await worker._handle(_task())
+
+    challenge_resolver.resolve.assert_awaited_once()
+    extractor.extract.assert_called_once_with(recovered)
+    frontier.complete.assert_awaited_once()

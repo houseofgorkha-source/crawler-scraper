@@ -5,6 +5,7 @@ formalizing what was previously only exercised via one-off manual scripts.
 """
 import asyncio
 
+from crawler.challenge import RendererChallengeResolver
 from crawler.scrape_worker import ScrapeWorker
 from tests.integration.test_worker_live import _store
 
@@ -83,3 +84,73 @@ async def test_fetch_failure_marks_target_failed(db, frontier, fixture_server):
     assert row["status"] == "pending"
     assert row["last_status_code"] == 404
     assert row["consecutive_failures"] == 1
+
+
+async def test_js_challenge_fixture_is_resolved_by_renderer(
+    db, frontier, fixture_server, renderer
+):
+    spec_id = await frontier.register_spec(
+        name="live-js-challenge-spec",
+        fields=[{"name": "h", "selector": "h1"}],
+    )
+    url = f"{fixture_server}/lab/js-challenge"
+    await frontier.submit_scrape_targets(spec_id, [url])
+
+    worker = ScrapeWorker(
+        frontier,
+        _store(),
+        renderer=renderer,
+        challenge_resolver=RendererChallengeResolver(renderer),
+        worker_id="live-s0",
+    )
+
+    await _run_one_batch(worker)
+
+    async with db.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT status, last_status_code, consecutive_failures
+            FROM scrape_targets
+            WHERE url = $1
+            """,
+            url,
+        )
+
+    assert row["last_status_code"] == 200
+    assert row["consecutive_failures"] == 0
+    assert row["status"] == "done"
+
+
+async def test_captcha_fixture_is_resolved_by_renderer(
+    db, frontier, fixture_server, renderer
+):
+    spec_id = await frontier.register_spec(
+        name="live-captcha-spec",
+        fields=[{"name": "h", "selector": "h1"}],
+    )
+    url = f"{fixture_server}/lab/captcha"
+    await frontier.submit_scrape_targets(spec_id, [url])
+
+    worker = ScrapeWorker(
+        frontier,
+        _store(),
+        renderer=renderer,
+        challenge_resolver=RendererChallengeResolver(renderer),
+        worker_id="live-s0",
+    )
+
+    await _run_one_batch(worker)
+
+    async with db.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT status, last_status_code, consecutive_failures
+            FROM scrape_targets
+            WHERE url = $1
+            """,
+            url,
+        )
+
+    assert row["last_status_code"] == 200
+    assert row["consecutive_failures"] == 0
+    assert row["status"] == "done"

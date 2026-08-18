@@ -21,7 +21,7 @@ import dataclasses
 import logging
 import uuid
 
-from .contracts import FetchOutcome, FetchResult
+from .contracts import Challenge, ChallengeResolution, FetchOutcome, FetchResult
 from .extract import HtmlExtractor
 from .fetch import HttpFetcher, needs_render
 from .metrics import CRAWL_TASKS, FETCH_DURATION_SECONDS
@@ -38,12 +38,13 @@ MAX_DEPTH = 6
 
 class CrawlWorker:
     def __init__(self, frontier, store, fetcher=None, renderer=None,
-                 extractor=None, worker_id: str | None = None,
-                 feed_scraper: bool = False):
+             extractor=None, worker_id: str | None = None,
+             feed_scraper: bool = False, challenge_resolver=None):
         self.frontier = frontier
         self.store = store
         self.fetcher = fetcher or HttpFetcher()
         self.renderer = renderer
+        self.challenge_resolver = challenge_resolver
         self.extractor = extractor or HtmlExtractor()
         self.worker_id = worker_id or f"worker-{uuid.uuid4().hex[:8]}"
         # Crawler -> Scraper feed, opt-in only (--feed-scraper). Off by
@@ -74,18 +75,29 @@ class CrawlWorker:
         # Second robots enforcement point. The claim query already gated on
         # domain policy, but that read may be minutes stale.
         policy = await self.frontier.policy_for(task.host, task.url)
-        if policy.is_stale:
-            policy = await self.frontier.refresh_robots(task.host, task.url)
-        if not policy.check_allowed(task.url):
-            await self.frontier.skip(task, reason="robots_denied")
-            CRAWL_TASKS.labels(outcome="robots_denied").inc()
-            return
 
         result = await self._fetch_with_escalation(task)
         await self.frontier.record_attempt(result, self.worker_id)
         FETCH_DURATION_SECONDS.labels(
             subsystem="crawler", render_mode=result.render_mode.value
         ).observe(result.duration_ms / 1000)
+
+        if result.challenge_type and self.challenge_resolver is not None:
+            challenge = Challenge(
+                challenge_type=result.challenge_type,
+                status_code=result.status_code,
+                url=result.final_url or task.url,
+                headers=result.headers,
+                body=result.body,
+            )
+            resolution = await self.challenge_resolver.resolve(challenge, task)
+            if resolution.outcome is ChallengeResolution.RESOLVED:
+                if resolution.fetch_result is not None:
+                    result = resolution.fetch_result
+            else:
+                await self.frontier.fail(result, max_failures=MAX_FAILURES)
+                CRAWL_TASKS.labels(outcome=result.outcome.value).inc()
+                return
 
         if result.outcome is FetchOutcome.NOT_MODIFIED:
             await self.frontier.reschedule(task, unchanged=True)
@@ -145,8 +157,9 @@ class CrawlWorker:
 
         result = await self.fetcher.fetch(task)
 
-        if (result.has_body and self.renderer is not None
-                and needs_render(result.body)):
+        body = result.body
+        if (body is not None and self.renderer is not None
+                and needs_render(body)):
             rendered = await self.renderer.render(task)
             if rendered.has_body:
                 # Record the evidence so this host stops paying the static
